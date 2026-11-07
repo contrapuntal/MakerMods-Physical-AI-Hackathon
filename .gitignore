@@ -1,0 +1,7 @@
+# Upstream repos are cloned by setup.sh, not vendored
+repos/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.tmp
