@@ -1,0 +1,58 @@
+# Overhead-camera calibration for NUCK-3. Pixel coordinates are in the 640x360 frame the model sees.
+# Tune from real frames: python -m harness snapshot --out /tmp/snap  (writes the frame + detections drawn over it).
+# Calibrated on the practice layout, Nov 7 ~15:10: the white basket (our bin) left of centre, the black strip with the
+# orange USB cables plugged into the USB ports at its top end, cubes and rods in front, balls loose around them.
+# MOVE THE BIN OR THE STRIP AND THESE REGIONS ARE WRONG: tape their spots, or re-take a snapshot and re-set them.
+
+frame_size: [640, 360]
+
+# Polygons (x, y).
+# The table, minus the laptops at the left and right edges.
+work_roi: [[140, 160], [468, 160], [468, 218], [600, 236], [600, 360], [0, 360], [0, 242]]
+# The USB ports at the top of the black strip, where the orange cables' plugs sit.
+hub_roi: [[328, 166], [362, 166], [362, 206], [328, 206]]
+# The white basket's opening.
+bin_roi: [[212, 148], [314, 148], [312, 208], [214, 210]]
+# Never look for objects here: the grippers at rest (black, and they would read as the 8-ball).
+ignore_rois:
+  - [[0, 268], [150, 268], [150, 360], [0, 360]]
+  - [[440, 284], [600, 284], [600, 360], [440, 360]]
+# Unused at run time (the tower is built where the base cube sits); kept for drawing.
+tower_roi: [[250, 230], [400, 230], [400, 330], [250, 330]]
+
+# HSV boxes (OpenCV units). Sampled on the layout: orange ball H5 S121 V210; red rod H0 S139 V198 (shape tells them
+# apart: a ball is small and round, a rod long); green ball H81 S182 (far more saturated than the green cube H68 S77
+# and rod H60 S75); white ball H107 S42 V184 (the basket is S16, the table S5).
+colors:
+  blue:        {h_lo: 95,  h_hi: 112, s_lo: 90,  s_hi: 255, v_lo: 60,  v_hi: 255}
+  green:       {h_lo: 52,  h_hi: 75,  s_lo: 45,  s_hi: 150, v_lo: 50,  v_hi: 255}
+  purple:      {h_lo: 150, h_hi: 172, s_lo: 70,  s_hi: 255, v_lo: 60,  v_hi: 255}
+  red:         {h_lo: 172, h_hi: 2,   s_lo: 125, s_hi: 255, v_lo: 120, v_hi: 255}
+  yellow:      {h_lo: 20,  h_hi: 35,  s_lo: 110, s_hi: 255, v_lo: 110, v_hi: 255}
+  orange:      {h_lo: 3,   h_hi: 14,  s_lo: 90,  s_hi: 210, v_lo: 150, v_hi: 255}
+  green_ball:  {h_lo: 76,  h_hi: 92,  s_lo: 140, s_hi: 255, v_lo: 100, v_hi: 255}
+  white:       {h_lo: 95,  h_hi: 120, s_lo: 28,  s_hi: 80,  v_lo: 140, v_hi: 235}
+  black:       {h_lo: 0,   h_hi: 179, s_lo: 0,   s_hi: 255, v_lo: 0,   v_hi: 45}
+  cable:       {h_lo: 0,   h_hi: 14,  s_lo: 60,  s_hi: 210, v_lo: 80,  v_hi: 255}
+
+cube_colors: [blue, green, purple]
+rod_colors: [red, green, yellow]
+ball_colors: [orange, green_ball]   # the two coin-flip colours; the harness says "green", not "green_ball"
+avoid_balls: [white]                # never picked, kept clear of, taken out of the bin if one lands there
+cable_colors: [cable]               # counted inside hub_roi only
+eight_ball: black
+
+cube_area: [250, 4000]
+rod_area: [120, 3000]
+ball_area: [60, 900]
+plug_area: [10, 1500]
+
+# Measured at the station, Nov 7 (inches).
+cube_height_in: 1.3      # cube is 2 x 2 x 1.3, lying with a 2 x 2 face (and its hole) up
+cube_side_in: 2.0
+rod_length_in: 4.0
+rod_diameter_in: 0.8
+rod_insert_in: 1.3       # measured: the rod sinks the full 1.3 in (the hole goes through the cube)
+usb_a_width_in: 0.59
+usb_c_width_in: 0.40
+px_per_cm: 4.3           # a cube's 2 in face is ~22 px wide in the overhead frame

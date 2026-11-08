@@ -17,7 +17,12 @@ Founders, Inc. SF Lab, 2 Marina Blvd B300, Building C, 3rd floor. Event page: ht
 | `repos/maker-arm-sdk` | Maker Arm v1 driver and the `maker-arm` CLI (`doctor`, `scan`, `zero`, `check`, `teleop`). macOS uses a serial SLCAN adapter. |
 | `repos/makermodslab` | MakerMods Lab web UI for calibrating, teleoperating, recording, training, and evaluating. **Close it before using any SDK**, because it holds the CAN adapter. |
 | `repos/metal-arm-harness` | Safety-enveloped CLI that an agent (Claude Code, for example) can drive. Supports `--arm maker` and `--backend sim`, so it's a good base for the Hill Climb harness. |
-| `repos/metal-python-ros` | Metal Arm SDK and ROS integration (reference). |
+| `repos/metal-python-ros` | Metal Arm SDK and ROS integration (reference). Its URDF and meshes feed the sim. |
+| `repos/dimos` | Dimensional OS (source checkout; manipulation, sim and learning extras). Its env runs the sim. |
+| `repos/physical-ai-hack-2026` | Dream Labs' hackathon kit, the same as `~/physical-ai-hacks` on the station. The sim uses its dataset writer. |
+| `sim/` | Our MuJoCo copy of the NUCK-3 station and the scripted-demo recorder. See `sim/README.md`. |
+| `sim_data/` | Sim datasets (LeRobot v2.1, kit layout). |
+| `dimos_hillclimb/` | The relay as Dimensional OS skills: DimOS's MCP server and LLM agent plan and sequence the match on top of our referee and verifiers (sim backend, and the real station through `python -m harness serve`). See `dimos_hillclimb/README.md`. |
 
 ## Install
 

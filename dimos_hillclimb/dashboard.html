@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hill Climb Dashboard</title>
+<style>
+  :root {
+    --bg: #f4f3ef; --panel: #ffffff; --ink: #1b1c1e; --muted: #6b6d72; --line: #e3e1da;
+    --accent: #2f5bd3; --ok: #1f8a4c; --ok-bg: #e5f4eb; --bad: #c2412d; --bad-bg: #fbe9e5;
+    --warn: #a86a00; --warn-bg: #fbf0d9; --run: #2f5bd3; --run-bg: #e6ecfb; --track: #ecebe5;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121315; --panel: #1b1c1f; --ink: #ecebe7; --muted: #9a9ca2; --line: #2b2c30;
+      --accent: #7c9cff; --ok: #4cc37f; --ok-bg: #18301f; --bad: #ff7a63; --bad-bg: #3a1d18;
+      --warn: #f0b44a; --warn-bg: #33270f; --run: #7c9cff; --run-bg: #1d2540; --track: #26272b;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #121315; --panel: #1b1c1f; --ink: #ecebe7; --muted: #9a9ca2; --line: #2b2c30;
+    --accent: #7c9cff; --ok: #4cc37f; --ok-bg: #18301f; --bad: #ff7a63; --bad-bg: #3a1d18;
+    --warn: #f0b44a; --warn-bg: #33270f; --run: #7c9cff; --run-bg: #1d2540; --track: #26272b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  .wrap { max-width: 1320px; margin: 0 auto; padding: 16px; }
+  header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+  h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  .pill { font: 600 11px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; padding: 5px 8px;
+          border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.live { color: var(--ok); border-color: currentColor; }
+  .pill.down { color: var(--bad); border-color: currentColor; }
+  .spacer { flex: 1; }
+  .big { display: flex; gap: 28px; align-items: flex-end; }
+  .stat .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .stat .value { font: 650 30px/1.05 var(--mono); font-variant-numeric: tabular-nums; }
+  .stat .sub { font: 12px var(--mono); color: var(--muted); }
+  .clockbar { height: 4px; background: var(--track); border-radius: 2px; margin-top: 6px; overflow: hidden; width: 150px; }
+  .clockbar > i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .4s linear; }
+  .clockbar.low > i { background: var(--bad); }
+
+  .grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  .card h2 { font-size: 12px; font-weight: 650; margin: 0 0 10px; color: var(--muted);
+             text-transform: uppercase; letter-spacing: .06em; display: flex; align-items: center; gap: 8px; }
+  .stack { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+
+  .frame { position: relative; aspect-ratio: 16 / 9; background: #0c0c0d; border-radius: 8px; overflow: hidden; }
+  .frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .frame .age { position: absolute; right: 8px; bottom: 8px; font: 11px var(--mono); color: #fff;
+                background: rgba(0,0,0,.55); padding: 3px 6px; border-radius: 4px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
+  select, input, button { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+                          border-radius: 8px; padding: 7px 10px; min-height: 36px; }
+  input { min-width: 0; }
+  button { cursor: pointer; font-weight: 600; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--bad); }
+  button:disabled { opacity: .5; cursor: default; }
+  .agent { display: flex; gap: 8px; margin-top: 8px; }
+  .agent input { flex: 1; }
+  .toast { font-size: 12px; color: var(--muted); min-height: 18px; margin-top: 6px; overflow-wrap: anywhere; }
+
+  .stages { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .stage { border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+  .stage .name { font-weight: 650; }
+  .stage .pts { font: 12px var(--mono); color: var(--muted); }
+  .stage .st { font: 600 11px var(--mono); margin-top: 6px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+  .stage.current { border-color: var(--run); background: var(--run-bg); }
+  .stage.current .st { color: var(--run); }
+  .stage.passed { border-color: var(--ok); background: var(--ok-bg); }
+  .stage.passed .st { color: var(--ok); }
+
+  .tower { display: grid; grid-template-columns: 58px 1fr; gap: 14px; align-items: end; }
+  .meter { position: relative; height: 150px; background: var(--track); border-radius: 6px; overflow: hidden; }
+  .meter > i { position: absolute; left: 0; right: 0; bottom: 0; background: var(--accent); transition: height .4s; }
+  .meter.pass > i { background: var(--ok); }
+  .meter .bar { position: absolute; left: -2px; right: -2px; border-top: 2px dashed var(--ink); }
+  .meter .bar span { position: absolute; right: 2px; top: -16px; font: 10px var(--mono); }
+  .pieces { display: flex; flex-direction: column-reverse; gap: 4px; }
+  .piece { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .sw { width: 14px; height: 14px; border-radius: 3px; border: 1px solid rgba(0,0,0,.15); flex: none; }
+  .sw.rod { width: 6px; height: 18px; margin: 0 4px; }
+  .theight { font: 650 22px var(--mono); }
+  .muted { color: var(--muted); }
+
+  .bin { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .tile { border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+  .tile .n { font: 650 24px var(--mono); }
+  .tile.alert { border-color: var(--bad); background: var(--bad-bg); color: var(--bad); }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em;
+       font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td.t, td.d { font: 12px var(--mono); color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.s { font: 12px var(--mono); white-space: nowrap; }
+  td.m { overflow-wrap: anywhere; }
+  .tag { font: 600 10px var(--mono); padding: 3px 6px; border-radius: 4px; text-transform: uppercase; letter-spacing: .05em; }
+  .tag.ok { background: var(--ok-bg); color: var(--ok); }
+  .tag.failed, .tag.error { background: var(--bad-bg); color: var(--bad); }
+  .tag.refused { background: var(--warn-bg); color: var(--warn); }
+  .tag.running { background: var(--run-bg); color: var(--run); }
+  .logwrap { max-height: 420px; overflow: auto; }
+  .empty { color: var(--muted); padding: 18px 8px; text-align: center; }
+  @media (max-width: 600px) {
+    .big { gap: 16px; } .stat .value { font-size: 24px; }
+    td.d, th.d { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Hill Climb relay</h1>
+    <span class="pill" id="backend">…</span>
+    <span class="pill" id="conn">connecting</span>
+    <span class="spacer"></span>
+    <div class="big">
+      <div class="stat">
+        <div class="label">Match clock</div>
+        <div class="value" id="clock">–:––</div>
+        <div class="clockbar" id="clockbar"><i></i></div>
+      </div>
+      <div class="stat">
+        <div class="label">Score</div>
+        <div class="value" id="score">0</div>
+        <div class="sub" id="ourcolor">&nbsp;</div>
+      </div>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="stack">
+      <section class="card">
+        <h2>Overhead camera</h2>
+        <div class="frame"><img id="frame" alt="Overhead camera frame"><span class="age" id="frameage">–</span></div>
+        <div class="controls">
+          <select id="color" aria-label="Our ball colour"></select>
+          <input id="seed" type="number" placeholder="seed" aria-label="Sim layout seed" style="width:90px">
+          <button class="primary" id="start">Start match</button>
+          <button class="danger" id="park">Park arms</button>
+        </div>
+        <div class="agent">
+          <input id="msg" placeholder="Message to the DimOS agent, e.g. “Go. Our colour is orange.”" aria-label="Message to the agent">
+          <button id="send">Send</button>
+        </div>
+        <div class="toast" id="toast"></div>
+      </section>
+    </div>
+
+    <div class="stack">
+      <section class="card">
+        <h2>Stages</h2>
+        <div class="stages" id="stages"></div>
+      </section>
+      <section class="card">
+        <h2>Tower</h2>
+        <div class="tower">
+          <div class="meter" id="meter"><i></i><div class="bar"><span>6 in</span></div></div>
+          <div>
+            <div class="theight" id="theight">0.0 in</div>
+            <div class="muted" id="tsub">no pieces yet</div>
+            <div class="pieces" id="pieces" style="margin-top:10px"></div>
+          </div>
+        </div>
+      </section>
+      <section class="card">
+        <h2>Our bin</h2>
+        <div class="bin">
+          <div class="tile"><div class="muted">Our colour</div><div class="n" id="own">0</div></div>
+          <div class="tile"><div class="muted">Other colour</div><div class="n" id="other">0</div></div>
+          <div class="tile" id="eightTile"><div class="muted">Black 8-ball</div><div class="n" id="eight">no</div></div>
+          <div class="tile"><div class="muted">Points from balls</div><div class="n" id="ballpts">0</div></div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <section class="card" style="margin-top:16px">
+    <h2>Skill calls <span class="muted" id="callcount" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+    <div class="logwrap">
+      <table>
+        <thead><tr><th>Match t</th><th>Skill</th><th>Result</th><th>Message</th><th class="d">Took</th></tr></thead>
+        <tbody id="calls"><tr><td colspan="5" class="empty">No calls yet. Start a match, then let the agent (or <code>drive</code>) play.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const SWATCH = { blue: "#3f7fd6", green: "#5cbf4a", purple: "#b46fd6", red: "#e0503f", yellow: "#efcf3d",
+                 orange: "#f58a2a", white: "#f2f2f2", black: "#111" };
+const STAGES = [["unplug", "Unplug", "+10"], ["stack", "Stack", "+20"], ["balls", "Balls", "+5 each"]];
+let colorsFilled = false, lastOk = 0;
+
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function mmss(s) { s = Math.max(0, Math.round(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; }
+function toast(t) { $("toast").textContent = t; }
+
+async function post(path, body) {
+  try {
+    const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+    const j = await r.json(); toast(j.message || (j.ok ? "done" : "failed"));
+  } catch (e) { toast("request failed: " + e); }
+}
+
+function render(s) {
+  const m = s.match;
+  $("backend").textContent = s.backend === "station" ? "Real station" : "Sim";
+  if (!colorsFilled) {
+    $("color").innerHTML = s.ball_colors.map(c => `<option value="${c}">${c}</option>`).join("");
+    $("color").value = m.own_color; colorsFilled = true;
+    $("seed").style.display = s.backend === "sim" ? "" : "none";
+  }
+  // clock + score
+  if (s.started) {
+    $("clock").textContent = mmss(m.elapsed_s);
+    const frac = Math.min(1, m.elapsed_s / s.time_limit_s);
+    $("clockbar").querySelector("i").style.width = (frac * 100) + "%";
+    $("clockbar").classList.toggle("low", m.time_left_s < 30);
+  } else { $("clock").textContent = "–:––"; }
+  $("score").textContent = m.score;
+  $("ourcolor").innerHTML = `<span class="sw" style="display:inline-block;vertical-align:-2px;background:${SWATCH[m.own_color] || "#999"}"></span> ${esc(m.own_color)}` + (m.loses_on_eight_ball ? " · <b style='color:var(--bad)'>8-ball in bin</b>" : "");
+  // stages
+  $("stages").innerHTML = STAGES.map(([key, name, pts]) => {
+    const passed = key in m.passed, current = s.started && m.stage === key;
+    const st = passed ? `passed ${m.passed[key]} s` : current ? "in progress" : (s.started ? "locked" : "–");
+    return `<div class="stage ${passed ? "passed" : current ? "current" : ""}"><div class="name">${name}</div><div class="pts">${pts}</div><div class="st">${st}</div></div>`;
+  }).join("");
+  // tower
+  const t = s.tower, scaleTop = Math.max(t.pass_in * 1.35, t.height_in * 1.1, 1);
+  $("meter").querySelector("i").style.height = (100 * t.height_in / scaleTop) + "%";
+  $("meter").querySelector(".bar").style.bottom = (100 * t.pass_in / scaleTop) + "%";
+  $("meter").querySelector(".bar span").textContent = `${t.pass_in.toFixed(1)} in`;
+  $("meter").classList.toggle("pass", t.height_in >= t.pass_in);
+  $("theight").textContent = `${t.height_in.toFixed(1)} in`;
+  $("tsub").textContent = t.pieces.length ? `${t.pieces.length} piece${t.pieces.length > 1 ? "s" : ""}, bar ${t.pass_in.toFixed(1)} in` : "no pieces yet";
+  $("pieces").innerHTML = t.pieces.map(p => {
+    const [kind, color] = p.split(":");
+    return `<div class="piece"><span class="sw ${kind === "rod" ? "rod" : ""}" style="background:${SWATCH[color] || "#999"}"></span>${esc(color)} ${esc(kind)}</div>`;
+  }).join("");
+  // bin
+  $("own").textContent = m.bin.own; $("other").textContent = m.bin.other;
+  $("eight").textContent = m.bin.eight_ball ? "IN BIN" : "no";
+  $("eightTile").classList.toggle("alert", !!m.bin.eight_ball);
+  $("ballpts").textContent = 5 * m.bin.own - 5 * m.bin.other;
+  // calls, newest first
+  const calls = s.calls.slice().reverse();
+  if (s.running) calls.unshift({ ...s.running, status: "running", message: "…", seconds: (s.server_time - s.running.t).toFixed(1) });
+  $("callcount").textContent = s.calls.length ? `${s.calls.length} so far` : "";
+  if (calls.length) {
+    $("calls").innerHTML = calls.map(c => {
+      const args = (c.args || []).map(a => esc(a)).join(", ");
+      return `<tr><td class="t">${c.match_s != null ? c.match_s.toFixed(1) + " s" : "–"}</td>`
+        + `<td class="s">${esc(c.skill)}(${args})</td>`
+        + `<td><span class="tag ${c.status}">${c.status}</span></td>`
+        + `<td class="m">${esc(c.message)}</td><td class="d">${c.seconds ?? ""} s</td></tr>`;
+    }).join("");
+  }
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/state", { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    render(await r.json());
+    lastOk = Date.now();
+    $("conn").textContent = "live"; $("conn").className = "pill live";
+  } catch (e) {
+    if (Date.now() - lastOk > 2000) { $("conn").textContent = "disconnected"; $("conn").className = "pill down"; }
+  }
+  setTimeout(poll, 500);
+}
+
+let frameAt = 0, frameUrl = null;
+async function nextFrame() {
+  // fetch with a timeout, so a stalled request (server restarting, a long motion) never stops the feed
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 3000);
+  try {
+    const r = await fetch("/api/frame.jpg?t=" + Date.now(), { cache: "no-store", signal: ctl.signal });
+    if (!r.ok) throw new Error(r.status);
+    const url = URL.createObjectURL(await r.blob());
+    $("frame").src = url;
+    if (frameUrl) URL.revokeObjectURL(frameUrl);
+    frameUrl = url; frameAt = Date.now();
+    setTimeout(nextFrame, 250);
+  } catch (e) {
+    setTimeout(nextFrame, 1000);
+  } finally { clearTimeout(timer); }
+}
+setInterval(() => { $("frameage").textContent = frameAt ? `${((Date.now() - frameAt) / 1000).toFixed(1)} s ago` : "–"; }, 250);
+
+$("start").onclick = () => post("/api/start", { own_color: $("color").value, seed: $("seed").value });
+$("park").onclick = () => post("/api/park");
+$("send").onclick = () => { const v = $("msg").value.trim(); if (v) { post("/api/agent", { message: v }); $("msg").value = ""; } };
+$("msg").addEventListener("keydown", e => { if (e.key === "Enter") $("send").click(); });
+poll(); nextFrame();
+</script>
+</body>
+</html>
