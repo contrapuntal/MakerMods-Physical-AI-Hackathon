@@ -20,14 +20,21 @@ from types import SimpleNamespace
 
 import pytest
 
-try:  # harness.claude_check imports anthropic at module level; the main env does not have it
-    import anthropic  # noqa: F401
-except ImportError:
-    sys.modules["anthropic"] = types.ModuleType("anthropic")
+from harness.config import MatchConfig
+from harness.freeze import FreezeControl, StateFile
 
+# harness.claude_check imports anthropic at module level and the main env lacks it: import dream_executor with a
+# stand-in, removed again afterwards so it does not leak into other tests.
+_saved = sys.modules.get("anthropic")
+if _saved is None:
+    try:
+        import anthropic  # noqa: F401
+    except ImportError:
+        sys.modules["anthropic"] = types.ModuleType("anthropic")
 from harness import dream_executor  # noqa: E402
-from harness.config import MatchConfig  # noqa: E402
-from harness.freeze import FreezeControl, StateFile  # noqa: E402
+if _saved is None and isinstance(sys.modules.get("anthropic"), types.ModuleType) \
+        and not hasattr(sys.modules["anthropic"], "Anthropic"):
+    del sys.modules["anthropic"]
 
 
 class StubWorld:
@@ -36,7 +43,9 @@ class StubWorld:
         self.states: list[dict] = []  # every state.json write, in order
         self.lock_error: Exception | None = None
         self.view_error: OSError | None = None
+        self.lock_args: list = []
         self.view_ports: list[int] = []
+        self.watched: list = []
         self.view_clients: list = []
         self.loop_error: Exception | None = None
         self.loop_gate: asyncio.Event | None = None  # ControlLoop.run() waits on it when set
@@ -106,6 +115,7 @@ def stub_dream(monkeypatch) -> StubWorld:
 
     @contextlib.contextmanager
     def holding(path, holder):
+        world.lock_args.append((path, holder))
         if world.lock_error is not None:
             raise world.lock_error
         world.calls.append("lock_acquired")
@@ -198,6 +208,9 @@ def stub_dream(monkeypatch) -> StubWorld:
             world.view_clients.append(client)
             self.url = f"http://127.0.0.1:{port}/"
 
+        def watch(self, client) -> None:
+            world.watched.append(client)
+
         def close(self) -> None:
             world.calls.append("view_closed")
 
@@ -253,6 +266,8 @@ def test_holds_arms_lock_for_whole_run(stub_dream, tmp_path):
     assert calls[-1] == "lock_released"
     assert calls.index("lock_released") > max(i for i, c in enumerate(calls) if c == "torque_off")
     assert calls.index("open_arm") > calls.index("lock_acquired")
+    path, holder = stub_dream.lock_args[0]
+    assert path == Path("~/.dreamlabs/arms.lock").expanduser() and holder == "harness run"
 
 
 def test_lock_held_elsewhere_fails_cleanly(stub_dream, tmp_path):
@@ -296,4 +311,50 @@ def test_exception_writes_error_state(stub_dream, tmp_path):
         run(stub_dream, tmp_path)
     final = json.loads((tmp_path / "state.json").read_text())
     assert final["state"] == "error" and "loop blew up" in final["error"]
-    assert stub_dream.calls.count("torque_off") == 2
+    calls = stub_dream.calls
+    assert calls.count("torque_off") == 2
+    assert calls.index("lock_released") > max(i for i, c in enumerate(calls) if c == "torque_off")
+
+
+def test_report_failure_still_releases_lock_and_writes_error(stub_dream, tmp_path, monkeypatch):
+    def boom(relay, out_dir):
+        raise OSError("disk full")
+    monkeypatch.setattr(dream_executor, "_write_report", boom)
+    with pytest.raises(OSError):
+        run(stub_dream, tmp_path)
+    assert stub_dream.calls[-1] == "lock_released"
+    assert stub_dream.states[-1]["state"] == "error"
+
+
+def test_view_follows_restarted_client(stub_dream, tmp_path):
+    stub_dream.finish = False
+    stub_dream.loop_error = RuntimeError("stalled")
+    with pytest.raises(RuntimeError):
+        run(stub_dream, tmp_path)
+    assert stub_dream.watched == [stub_dream.client] * 3  # one per restart
+
+
+def test_real_supervise_writes_stage(tmp_path, monkeypatch):
+    # The real _supervise (the fixture replaces it): a stage change must reach state.json, although the loop's
+    # own `state` is a robot state.
+    monkeypatch.setattr(dream_executor, "POLL_S", 0.001)
+    monkeypatch.setattr(dream_executor.vision, "detect", lambda *a: None)
+    frame = SimpleNamespace(data=None, timestamp_s=0.0)
+    arm = SimpleNamespace(gripper=0.0)
+    loop = SimpleNamespace(video={"scene": frame}, state=SimpleNamespace(left=arm, right=arm), task="t")
+    relay = SimpleNamespace(stage="unplug", confirm_kinds=set(), pending_confirm=None, step=None,
+                            observe=lambda *a: dream_executor.Outcome.RUNNING)
+    statefile = StateFile(tmp_path, link=tmp_path / "link")
+    stop = asyncio.Event()
+
+    async def go():
+        task = asyncio.create_task(dream_executor._supervise(
+            loop, relay, SimpleNamespace(calibration=None), stop, tmp_path, SimpleNamespace(available=False), statefile=statefile))
+        await asyncio.sleep(0.05)
+        relay.stage = "stack"
+        await asyncio.sleep(0.05)
+        stop.set()
+        await task
+
+    asyncio.run(go())
+    assert json.loads((tmp_path / "state.json").read_text())["stage"] == "stack"

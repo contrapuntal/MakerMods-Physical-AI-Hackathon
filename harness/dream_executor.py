@@ -134,7 +134,8 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                 async with loop:
                     runner = asyncio.create_task(loop.run(), name="dream-loop")
                     supervisor = asyncio.create_task(
-                        _supervise(loop, relay, match, stop, out_dir, claude, go_rgb=first.data, state=state), name="relay")
+                        _supervise(loop, relay, match, stop, out_dir, claude, go_rgb=first.data, statefile=state),
+                        name="relay")
                     stopped = asyncio.create_task(stop.wait(), name="stop")
                     await asyncio.wait({runner, supervisor, stopped}, return_when=asyncio.FIRST_COMPLETED)
                     for t in (supervisor, stopped):
@@ -182,6 +183,8 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                     fault = exc
                     break
                 client = await asyncio.to_thread(rrun.open_client, dream_config)
+                if view is not None:
+                    view.watch(client)  # keep the :8093 page following the new client
                 # Warm the new client's IK first, as dreamcli does before the arms move: skipping it crashed the
                 # first answer of a restarted loop (SVD did not converge).
                 if not await asyncio.to_thread(client.wait_for_ik, rrun.TRAJ_WARMUP_S):
@@ -205,12 +208,20 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                 view.close()
         for name, opened in arms.items():
             control.run_teardown(f"switch {name} arm off", opened.torque_off)
-        _write_report(relay, out_dir)
-        lock.close()
-        if error is None:
-            _set_state(state, state="done", score=int(relay.score()))
-        else:
-            _set_state(state, state="error", error=error)
+        try:
+            _write_report(relay, out_dir)
+        except BaseException as exc:
+            error = error or str(exc) or type(exc).__name__
+            raise
+        finally:
+            lock.close()
+            if error is None:
+                try:
+                    _set_state(state, state="done", score=int(relay.score()))
+                except Exception as exc:  # noqa: BLE001
+                    _set_state(state, state="error", error=str(exc))
+            else:
+                _set_state(state, state="error", error=error)
     return relay
 
 
@@ -255,7 +266,7 @@ async def _first_frame(reader, timeout_s: float = 10.0):
 
 
 async def _supervise(loop, relay: Relay, match: MatchConfig, stop: asyncio.Event, out_dir: pathlib.Path,
-                     claude: ClaudeVerifier, go_rgb=None, state=None) -> None:
+                     claude: ClaudeVerifier, go_rgb=None, statefile=None) -> None:
     if claude.available:
         relay.confirm_kinds = {"unplug", "hold"}  # the two pass bars that, if wrong, mean a DQ or a lost +20
         _log.info("Claude vision checks on (%s)", "unplug and tower confirmations, 8-ball watch")
@@ -264,12 +275,12 @@ async def _supervise(loop, relay: Relay, match: MatchConfig, stop: asyncio.Event
     pending: dict[str, asyncio.Task] = {}  # question -> running Claude call
     last_unplug_ask = 0.0
     saved = len(list(out_dir.glob("step_*.jpg")))  # carries on numbering after a loop restart
-    stage = relay.stage
+    stage = None  # a restarted supervisor writes the current stage on its first poll
     while not stop.is_set():
         await asyncio.sleep(POLL_S)
         if relay.stage != stage:
             stage = relay.stage
-            _set_state(state, stage=stage)
+            _set_state(statefile, stage=stage)
         frame = loop.video.get(OVERHEAD)
         state = loop.state
         if frame is None or state is None:
