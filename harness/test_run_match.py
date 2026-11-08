@@ -1266,3 +1266,18 @@ def test_real_supervise_writes_eight_ball_alert(tmp_path, monkeypatch):
     asyncio.run(go())
     assert relay.eight_ball_alert is True
     assert json.loads((tmp_path / "state.json").read_text())["eight_ball_alert"] is True
+
+
+def test_freeze_while_starting_never_writes_freezing(stub_dream, tmp_path, ctl):
+    """No arm is open yet: state stays `starting` until the pre-open abort writes `done` (frozen_before_open)."""
+    def slow_open():
+        freeze(ctl)
+        time.sleep(0.2)  # the loop thread handles the wake while open_client is still running
+    stub_dream.on_open_client = slow_open
+    state = RecordingState(tmp_path, stub_dream)
+    state.update(state="starting")  # what the CLI writes before run_match
+    asyncio.run(dream_executor.run_match(MatchConfig(own_color="white"), "ckpt", dry_run=False, out_dir=tmp_path,
+                                         ctl=ctl, state=state))
+    seen = [s["state"] for s in stub_dream.states]
+    assert "freezing" not in seen
+    assert seen[-1] == "done" and stub_dream.states[-1]["reason"] == "frozen_before_open"

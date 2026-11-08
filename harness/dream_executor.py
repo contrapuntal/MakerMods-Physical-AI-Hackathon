@@ -84,8 +84,10 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
     def _woken() -> None:
         """Runs on the loop thread, never in the signal handler: wake the loop, and say `freezing` until `frozen`."""
         stop.set()
-        if state is not None and state.data.get("state") in ("starting", "running", "homing"):
-            _set_state(state, state="freezing")  # not while frozen/parking/done: a repeat freeze changes nothing
+        # Not while starting (no arm is open: the run aborts to `done`, reason frozen_before_open, and the state
+        # stays `starting` until then), nor while frozen/parking/done: a repeat freeze changes nothing.
+        if state is not None and state.data.get("state") in ("running", "homing"):
+            _set_state(state, state="freezing")
 
     ctl.on_freeze = lambda: aloop.call_soon_threadsafe(_woken)  # the handler itself does no arm or file work
     # The end signals use signal.signal like SIGUSR1 (not loop.add_signal_handler, whose callback is deferred until

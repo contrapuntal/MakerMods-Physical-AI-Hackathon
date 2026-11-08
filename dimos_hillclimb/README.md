@@ -122,7 +122,7 @@ with `readlink ~/.dreamlabs/current-harness-run` (the run dir), then the `pid` i
 - `<run_dir>/state.json` (written atomically) has `version`, `state`, `pid`, `started_at`, `stage`, `dry_run`,
   `freeze_supported`, `score`, `alarm`, `fault` (only on the fault-while-frozen path), `error`, `reason`,
   `eight_ball_alert`, `updated_at`. `state` is one of `starting`, `running`, `freezing`, `frozen`, `homing`, `parking`,
-  `done`, `error`; `freezing` can follow `starting`, `running` or `homing`. `reason` is null except on a `done` that
+  `done`, `error`; `freezing` can follow `running` or `homing` (a freeze during `starting` stays `starting` until the run aborts to `done`). `reason` is null except on a `done` that
   was not a normal finish: `frozen_before_open`, `ended_before_open` or `freeze_during_park`. `eight_ball_alert` turns
   true when Claude sees the black 8-ball in our bin. The symlink `~/.dreamlabs/current-harness-run` points at the run
   dir (`~/hackathon_runs/<time>` unless `--out`); a run dir is never reused: the default gets a `-<pid>` suffix on a
