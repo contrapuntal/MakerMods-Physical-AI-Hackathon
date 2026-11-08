@@ -7,8 +7,9 @@
     ~/dream-env/bin/python -m harness snapshot --out /tmp/snap          # overhead frame + detections, for calibration
     ~/dream-env/bin/python -m harness detect FRAME.jpg [...]             # detections on saved frames (works anywhere)
 
-`run` takes the match's whole input before "go" (our ball colour from the coin flip) and then runs unattended, as the
-rubric requires. Ctrl-C stops it: the arms hold, move home and switch off.
+`run` takes the match's whole input before "go" (optionally our ball colour from the coin flip: without --color every
+non-white ball is ours) and then runs unattended, as the rubric requires. Ctrl-C stops it: the arms hold, move home
+and switch off.
 """
 
 from __future__ import annotations
@@ -21,11 +22,60 @@ import pathlib
 import signal
 import sys
 import time
+from typing import TYPE_CHECKING
 
 from harness.freeze import FreezeControl, StateFile
 
+if TYPE_CHECKING:
+    from harness.config import Calibration
+
 DEFAULT_CALIBRATION = pathlib.Path(__file__).resolve().parent / "calibration.yaml"  # same as harness.config's
 DEFAULT_MODEL = "dreamlabs/dream-1-beta"
+EXIT_ABORTED = 3  # `run` ended before the arms opened (frozen or ended): state "done", but not a normal run
+END_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def _run_dir(out: pathlib.Path | None) -> pathlib.Path:
+    """The run's folder, never one that already holds a run: a fresh timestamped dir (with a `-<pid>` suffix if that
+    name is taken), or --out when it has no state.json yet."""
+    if out is not None:
+        out = pathlib.Path(out).expanduser()
+        if (out / "state.json").exists():
+            sys.exit(f"{out} already has a state.json (an earlier or running harness run); pick another --out")
+        return out
+    base = pathlib.Path("~/hackathon_runs").expanduser()
+    base.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for name in (stamp, f"{stamp}-{os.getpid()}"):
+        try:
+            (base / name).mkdir()
+        except FileExistsError:
+            continue
+        return base / name
+    sys.exit(f"could not make a fresh run folder under {base}")
+
+
+def _install_early_handlers(ctl: FreezeControl) -> dict[int, object]:
+    """Before the slow imports: SIGUSR1 freezes, the end signals request an end. Returns the ORIGINAL handlers, for
+    restoring at exit. A second end signal before run_match takes over forces the default behaviour (the process is
+    stuck in an import or a hung open): the original handler is restored and KeyboardInterrupt is raised."""
+    originals: dict[int, object] = {signal.SIGUSR1: ctl.install_freeze_signal()}
+    ends = 0
+
+    def make(signum: int, previous: object):
+        def handler(sn, frame) -> None:
+            nonlocal ends
+            ends += 1
+            if ends < 2:
+                ctl.request_end()
+                return
+            signal.signal(signum, previous)  # type: ignore[arg-type]
+            raise KeyboardInterrupt("second end signal before the harness started")
+        return handler
+
+    for signum in END_SIGNALS:
+        originals[signum] = signal.signal(signum, make(signum, signal.getsignal(signum)))
+    return originals
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -62,26 +112,41 @@ def main(argv: list[str] | None = None) -> None:
     d.add_argument("--calibration", type=pathlib.Path, default=DEFAULT_CALIBRATION)
     args = ap.parse_args(argv)
     ctl = state = out = None
+    originals: dict[int, object] = {}
     if args.cmd == "run":
+        out = _run_dir(args.out)  # refuses a dir that already holds a run, before anything else is touched
         # Before the slow imports, so a freeze said while they load is caught and the run aborts before the arms open.
-        out = args.out or pathlib.Path("~/hackathon_runs").expanduser() / time.strftime("%Y%m%d-%H%M%S")
         ctl = FreezeControl()
-        ctl.install_freeze_signal()
-        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):  # an end before run_match's handlers exist
-            signal.signal(signum, lambda signum, frame: ctl.request_end())
+        originals = _install_early_handlers(ctl)
         state = StateFile(out)
         state.update(state="starting", pid=os.getpid(), started_at=time.time(), dry_run=args.dry_run,
-                     freeze_supported=True, stage=None, score=None, alarm=None, error=None, version=1)
+                     freeze_supported=True, stage=None, score=None, alarm=None, error=None, reason=None,
+                     eight_ball_alert=False, version=1)
         state.link_current()
     try:
-        _dispatch(args, ctl, state, out)
-    except BaseException as exc:  # incl. SystemExit from a bad --color; the agent reads state.json
-        if state is not None and not (isinstance(exc, SystemExit) and exc.code in (0, None)):
-            try:
-                state.update(state="error", error=str(exc.code if isinstance(exc, SystemExit) else exc) or repr(exc))
-            except Exception:
-                logging.getLogger(__name__).exception("could not write the error state")
-        raise
+        try:
+            _dispatch(args, ctl, state, out)
+        except BaseException as exc:  # incl. SystemExit from a bad --color; the agent reads state.json
+            if state is not None and not (isinstance(exc, SystemExit) and exc.code in (0, None)):
+                try:
+                    state.update(state="error", error=_describe_exit(exc))
+                except Exception:
+                    logging.getLogger(__name__).exception("could not write the error state")
+            raise
+    finally:
+        for signum, previous in originals.items():  # the originals, not run_match's or the early handlers
+            signal.signal(signum, previous)  # type: ignore[arg-type]
+    if state is not None and state.data.get("reason") in ("frozen_before_open", "ended_before_open"):
+        sys.exit(EXIT_ABORTED)  # state is "done", but the run never started: a caller's `&&` must not treat it as one
+
+
+def _describe_exit(exc: BaseException) -> str:
+    """Text for state.json's `error`: a SystemExit's message, or a sentence for a bare status code."""
+    if isinstance(exc, SystemExit):
+        if isinstance(exc.code, str) and exc.code:
+            return exc.code
+        return f"harness exited with status {exc.code}"
+    return str(exc) or repr(exc)
 
 
 def _dispatch(args: argparse.Namespace, ctl: FreezeControl | None, state: StateFile | None,
