@@ -34,6 +34,8 @@ _log = logging.getLogger(__name__)
 STATION_CONFIG = pathlib.Path("~/.dreamlabs/station.yaml").expanduser()
 OVERHEAD = "scene"  # the overhead camera's name in the station config
 POLL_S = 0.5
+VIEW_PORT = 8093  # Dream's DebugView: the frames the model sees, on 127.0.0.1 only (the LiveKit agent reads it
+#                    through an ssh tunnel); the page `dreamcli robot run --view` serves
 
 
 async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_dir: pathlib.Path,
@@ -59,6 +61,7 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
     body = bodies.for_config(app)
     arms: dict = {}
     readers: list = []
+    view = None
     try:
         readers = await asyncio.to_thread(rrun.make_cameras, app)
         kin = rrun.make_kinematics(app)
@@ -80,6 +83,14 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         if not dry_run:
             _warm_later_stages(relay, model_for, match)
         clients = {m: await open_model(m) for m in models}
+        try:  # camera view for the LiveKit agent: Dream's own page of what the model sees; opens no camera
+            import dream
+            view = dream.DebugView(None, port=VIEW_PORT)
+            for c in clients.values():
+                view.watch(c)  # every stage's model: whichever is running shows
+            _log.info("what the model sees: %s", view.url)
+        except Exception as exc:  # noqa: BLE001 - a debug view must never stop a run
+            _log.warning("camera view cannot start on port %d (%s); carrying on without it", VIEW_PORT, exc)
         _log.info("models: %s", {s: model_for(s) for s in relay.m_stages})
         open_arm = body.open_arm_read_only if dry_run and body.open_arm_read_only is not None else body.open_arm
         for name, arm_cfg in (("left", app.follower_l), ("right", app.follower_r)):
@@ -224,6 +235,8 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                 # A fresh client, its IK warmed first as dreamcli does before the arms move: skipping it crashed the
                 # first answer of a restarted loop (SVD did not converge).
                 clients[current] = await open_model(current)
+                if view is not None:
+                    view.watch(clients[current])  # the restarted client shows too
                 continue
             break
         if not dry_run:
@@ -231,6 +244,9 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         if fault is not None:
             raise fault
     finally:
+        if view is not None:
+            with contextlib.suppress(Exception):
+                view.close()
         for reader in readers:
             reader.stop()
         for name, opened in arms.items():
