@@ -48,11 +48,27 @@ def test_interruptible_sleep_raises_after_freeze(ctl):
 
 def test_begin_end_allows_refreeze(ctl):
     os.kill(os.getpid(), signal.SIGUSR1)
-    ctl.begin_end()
+    assert ctl.begin_end() is False
     ctl.interruptible_sleep(0.01)
     os.kill(os.getpid(), signal.SIGUSR1)
     with pytest.raises(FreezeRequested):
         ctl.interruptible_sleep(0.01)
+
+
+def test_begin_end_reports_freeze_after_end_request(ctl):
+    ctl.request_end()
+    os.kill(os.getpid(), signal.SIGUSR1)
+    assert ctl.begin_end() is False
+    ctl.request_end()
+    assert ctl.begin_end() is True
+
+
+def test_on_freeze_exception_does_not_escape(ctl):
+    def boom():
+        raise RuntimeError("loop closed")
+    ctl.on_freeze = boom
+    os.kill(os.getpid(), signal.SIGUSR1)
+    assert ctl.frozen
 
 
 def test_state_file_atomic_and_schema(tmp_path):
@@ -80,8 +96,27 @@ def test_link_current_points_at_run_dir(tmp_path):
 def test_hold_measured_writes_measured_once():
     written = []
     arm = SimpleNamespace(read=lambda: SimpleNamespace(positions_rad=[1, 2], gripper=0.3), write=written.append)
-    hold_measured({"left": arm}, lambda pos, grip: ("cmd", list(pos), grip))
+    assert hold_measured({"left": arm}, lambda pos, grip: ("cmd", list(pos), grip)) == {}
     assert written == [("cmd", [1, 2], 0.3)]
+
+
+def test_hold_measured_clamps_gripper():
+    written = []
+    def mk(g):
+        return SimpleNamespace(read=lambda: SimpleNamespace(positions_rad=[0], gripper=g), write=written.append)
+    hold_measured({"a": mk(1.02), "b": mk(-0.003)}, lambda pos, grip: grip)
+    assert written == [1.0, 0.0]
+
+
+def test_hold_measured_isolates_arms():
+    written = []
+    def bad_read():
+        raise OSError("bus")
+    bad = SimpleNamespace(read=bad_read, write=written.append)
+    good = SimpleNamespace(read=lambda: SimpleNamespace(positions_rad=[0], gripper=0.5), write=written.append)
+    failed = hold_measured({"left": bad, "right": good}, lambda pos, grip: grip)
+    assert written == [0.5]
+    assert list(failed) == ["left"]
 
 
 def test_first_alarm():
@@ -90,10 +125,35 @@ def test_first_alarm():
     dead = SimpleNamespace(alarm=lambda: None, is_alive=lambda: False)
     assert first_alarm({"left": hot, "right": ok}) == "left: over temp"
     assert first_alarm({"left": ok, "right": dead}) == "right: not answering"
+    named = SimpleNamespace(alarm=lambda: "arm 'left': over temp", is_alive=lambda: True)
+    assert first_alarm({"left": named}) == "arm 'left': over temp"
     assert first_alarm({"left": ok}) is None
 
 
-def test_main_installs_freeze_before_heavy_imports():
+def test_main_installs_freeze_before_heavy_imports(tmp_path):
+    code = (
+        "import json, signal, sys\n"
+        "sys.modules['cv2'] = None\n"
+        "import harness.__main__ as m\n"
+        f"out = {str(tmp_path / 'run')!r}\n"
+        "try:\n"
+        "    m.main(['run', '--color', 'x', '--out', out])\n"
+        "except ImportError:\n"
+        "    pass\n"
+        "else:\n"
+        "    raise SystemExit('no ImportError')\n"
+        "h = signal.getsignal(signal.SIGUSR1)\n"
+        "assert getattr(h, '__func__', None) is not None and h.__func__.__name__ == '_on_sigusr1', h\n"
+        "st = json.load(open(out + '/state.json'))\n"
+        "assert st['freeze_supported'] is True\n"
+        "assert st['state'] == 'error' and 'cv2' in st['error'], st\n"
+    )
+    env = {**os.environ, "HOME": str(tmp_path)}
+    res = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True, text=True, timeout=60, env=env)
+    assert res.returncode == 0, res.stderr
+
+
+def test_main_help_text():
     code = (
         "import sys; sys.modules['cv2'] = None\n"
         "import harness.__main__ as m\n"

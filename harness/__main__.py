@@ -68,6 +68,16 @@ def main(argv: list[str] | None = None) -> None:
         state.update(state="starting", pid=os.getpid(), started_at=time.time(), dry_run=args.dry_run,
                      freeze_supported=True, stage=None, score=None, alarm=None, error=None, version=1)
         state.link_current()
+    try:
+        _dispatch(args, ctl, state, out)
+    except BaseException as exc:  # incl. SystemExit from a bad --color; the agent reads state.json
+        if state is not None and not (isinstance(exc, SystemExit) and exc.code in (0, None)):
+            state.update(state="error", error=str(exc.code if isinstance(exc, SystemExit) else exc) or repr(exc))
+        raise
+
+
+def _dispatch(args: argparse.Namespace, ctl: FreezeControl | None, state: StateFile | None,
+              out: pathlib.Path | None) -> None:
     import cv2
 
     from harness import vision
