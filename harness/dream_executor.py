@@ -26,6 +26,7 @@ import cv2
 
 from harness.claude_check import ClaudeVerifier
 from harness.config import MatchConfig
+from harness.freeze import FreezeControl, FreezeRequested, first_alarm, hold_measured
 from harness.relay import Outcome, Relay
 from harness import vision
 
@@ -34,6 +35,8 @@ _log = logging.getLogger(__name__)
 STATION_CONFIG = pathlib.Path("~/.dreamlabs/station.yaml").expanduser()
 OVERHEAD = "scene"  # the overhead camera's name in the station config
 POLL_S = 0.5
+FROZEN_POLL_S = 0.5  # how often the frozen wait looks for an end request
+ALARM_POLL_S = 1.0  # ... and for an arm alarm
 VIEW_PORT = 8093  # Dream's DebugView: what the model sees (the page `dreamcli robot run --view` serves)
 
 
@@ -54,7 +57,11 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
     from robots import bodies
     from robots import errors as rerrors
     from robots import arms_lock
+    from robots import types as rtypes
     import dream
+
+    if ctl is None:
+        ctl = FreezeControl()
 
     out_dir.mkdir(parents=True, exist_ok=True)
     # One holder of the arms at a time, as `dreamcli robot run` does; released last, after the arms switch off.
@@ -65,8 +72,10 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         _set_state(state, state="error", error=str(exc))
         raise
     stop = asyncio.Event()
+    aloop = asyncio.get_running_loop()
+    ctl.on_freeze = lambda: aloop.call_soon_threadsafe(stop.set)  # only wakes the loop: no arm or file work here
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        asyncio.get_running_loop().add_signal_handler(signum, stop.set)
+        aloop.add_signal_handler(signum, lambda: (stop.set(), ctl.request_end()))
 
     relay = Relay(match)
     app = rrun.with_task(rconfig.load(station_config), "hold the arms still")
@@ -76,6 +85,7 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
     readers: list = []
     view = None
     error: str | None = None
+    done_error: str | None = None  # a clean abort: written with state "done"
     try:
         readers = await asyncio.to_thread(rrun.make_cameras, app)
         kin = rrun.make_kinematics(app)
@@ -89,11 +99,17 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
             _log.info("what the model sees: %s", view.url)
         except OSError as exc:
             _log.warning("debug view cannot listen on port %d (%s); carrying on without it", VIEW_PORT, exc)
+        if ctl.frozen:  # a freeze while the harness was starting: the arms are never opened
+            done_error = "frozen before the arms opened"
+            return relay
         open_arm = body.open_arm_read_only if dry_run and body.open_arm_read_only is not None else body.open_arm
         for name, arm_cfg in (("left", app.follower_l), ("right", app.follower_r)):
             arm = open_arm(arm_cfg, name)
             arms[name] = followers.FollowerArm(name, rrun.DryRun(arm), home_rad=arm.home_rad) if dry_run else arm
-        if not dry_run and not await asyncio.to_thread(home.return_to_home, arms, duration_s=home.HOME_DURATION_S):
+        if ctl.frozen:
+            raise FreezeRequested  # opened but not homed: hold where they are
+        if not dry_run and not await asyncio.to_thread(home.return_to_home, arms, duration_s=home.HOME_DURATION_S,
+                                                       sleep=ctl.interruptible_sleep):
             raise RuntimeError("an arm did not reach home before the run")
         for reader in readers:
             reader.start()
@@ -101,6 +117,8 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
             reader.set_exposure_hold(True)
         overhead = next(r for r in readers if r.name == OVERHEAD)
         first = await _first_frame(overhead)
+        if ctl.frozen:
+            raise FreezeRequested
         # Find the bin and the strip where they stand today (the judges place them), then plan from that.
         layout = vision.locate_layout(first.data, match.calibration)
         match.calibration = vision.with_layout(match.calibration, layout)
@@ -191,11 +209,21 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                     _log.warning("restart: the IK's traj solve did not compile in time")
                 continue
             break
+        if ctl.frozen:
+            raise FreezeRequested  # the loop has exited and the arms hold: wait for the end, never go home
         _set_state(state, state="homing")
         if not dry_run:
-            await asyncio.to_thread(home.return_to_home, arms, duration_s=home.HOME_DURATION_S)
+            await asyncio.to_thread(home.return_to_home, arms, duration_s=home.HOME_DURATION_S,
+                                    sleep=ctl.interruptible_sleep)
         if fault is not None:
             raise fault
+    except FreezeRequested:
+        # Never an error: hold the arms, wait for an end request, then home. A freeze must not reach the caller.
+        try:
+            await _frozen_wait(arms, ctl, state, stop, home, rtypes, dry_run)
+        except BaseException as exc:
+            error = str(exc) or type(exc).__name__
+            raise
     except BaseException as exc:
         error = str(exc) or type(exc).__name__
         raise
@@ -217,12 +245,53 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
             lock.close()
             if error is None:
                 try:
-                    _set_state(state, state="done", score=int(relay.score()))
+                    _set_state(state, state="done", score=int(relay.score()), error=done_error)
                 except Exception as exc:  # noqa: BLE001
                     _set_state(state, state="error", error=str(exc))
             else:
                 _set_state(state, state="error", error=error)
     return relay
+
+
+async def _frozen_wait(arms: dict, ctl: FreezeControl, state, stop: asyncio.Event, home, rtypes,
+                       dry_run: bool) -> None:
+    """Holds the arms where they are until an end is requested, then homes. Returns once the end move is done.
+
+    The arms are commanded their own measured pose once (the driver's hold tick keeps it from there); there is no
+    motion and no switch-off here. A fault is written to state.json and the hold continues. A new freeze during
+    the end home move comes back here and holds again.
+    """
+    make_command = lambda positions, gripper: rtypes.ArmCommand(positions_rad=positions, gripper=gripper)  # noqa: E731
+    while True:
+        failed = await asyncio.to_thread(hold_measured, arms, make_command)
+        fields = {"alarm": "; ".join(f"{n}: could not hold ({e})" for n, e in failed.items())} if failed else {}
+        _set_state(state, state="frozen", **fields)  # only now: the control loop is closed and the arms hold
+        _log.warning("frozen: arms hold the measured pose; waiting for an end request")
+        last_alarm = fields.get("alarm")
+        next_alarm = time.monotonic() + ALARM_POLL_S
+        while not ctl.end_requested.is_set():
+            await asyncio.sleep(FROZEN_POLL_S)
+            if time.monotonic() >= next_alarm:
+                next_alarm = time.monotonic() + ALARM_POLL_S
+                try:
+                    alarm = await asyncio.to_thread(first_alarm, arms)
+                except Exception:  # noqa: BLE001 - a failed check must never drop the hold
+                    _log.exception("alarm check failed")
+                    alarm = None
+                if alarm and alarm != last_alarm:
+                    last_alarm = alarm
+                    _log.error("alarm while frozen: %s", alarm)
+                    _set_state(state, alarm=alarm)
+        if not ctl.begin_end():
+            continue  # a freeze arrived since the end request: keep holding (arms were not touched)
+        _set_state(state, state="homing")
+        try:
+            if not dry_run:
+                await asyncio.to_thread(home.return_to_home, arms, duration_s=home.HOME_DURATION_S,
+                                        sleep=ctl.interruptible_sleep)
+        except FreezeRequested:
+            continue  # frozen again mid-move: hold the pose it reached
+        return
 
 
 async def _reopen_cameras(rrun, app, readers: list, deadline_s: float) -> list | None:

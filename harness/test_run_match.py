@@ -11,9 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
+import os
+import signal
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,9 +42,27 @@ if _saved is None and isinstance(sys.modules.get("anthropic"), types.ModuleType)
     del sys.modules["anthropic"]
 
 
+class _Tee(list):
+    """`world.calls`; every entry also lands in `world.order`, which interleaves calls with state.json writes."""
+
+    def __init__(self, order: list) -> None:
+        super().__init__()
+        self.order = order
+
+    def append(self, item) -> None:
+        super().append(item)
+        self.order.append(item)
+
+
 class StubWorld:
     def __init__(self) -> None:
-        self.calls: list[str] = []
+        self.order: list[str] = []  # calls and "state:<name>" writes, in order
+        self.calls: list[str] = _Tee(self.order)
+        self.on_open_client = None  # called inside open_client (a worker thread)
+        self.on_home_sleep = None  # called as (home_call_no, sleep_no) inside each home move's sleeps
+        self.home_calls = 0
+        self.loop_exits = 0
+        self.alarm: str | None = None
         self.states: list[dict] = []  # every state.json write, in order
         self.lock_error: Exception | None = None
         self.view_error: OSError | None = None
@@ -63,6 +86,15 @@ class StubArm:
 
     def write(self, cmd) -> None:
         self.world.calls.append("write")
+
+    def read(self):
+        return SimpleNamespace(positions_rad=[0.1], gripper=1.5)  # gripper out of range: hold clamps it
+
+    def is_alive(self) -> bool:
+        return True
+
+    def alarm(self):
+        return self.world.alarm
 
     def torque_off(self) -> None:
         self.world.calls.append("torque_off")
@@ -106,6 +138,11 @@ def _module(name: str, **attrs) -> types.ModuleType:
 def stub_dream(monkeypatch) -> StubWorld:
     world = StubWorld()
 
+    @dataclasses.dataclass(frozen=True)
+    class ArmCommand:
+        positions_rad: list
+        gripper: float
+
     class ArmError(Exception): ...
     class SafetyStop(Exception): ...
     class CameraError(Exception): ...
@@ -138,6 +175,7 @@ def stub_dream(monkeypatch) -> StubWorld:
             return self
 
         async def __aexit__(self, *exc):
+            world.calls.append("loop_exit")
             return False
 
         async def run(self) -> None:
@@ -161,11 +199,45 @@ def stub_dream(monkeypatch) -> StubWorld:
         def torque_off(self) -> None:
             self.arm.torque_off()
 
+        def read(self):
+            return self.arm.read()
+
+        def write(self, cmd) -> None:
+            self.arm.write(cmd)
+
+        def is_alive(self) -> bool:
+            return self.arm.is_alive()
+
+        def alarm(self):
+            return self.arm.alarm()
+
+    class DryArm:  # Dream's DryRun: reads through, swallows writes
+        def __init__(self, arm) -> None:
+            self.arm = arm
+
+        def read(self):
+            return self.arm.read()
+
+        def write(self, cmd) -> None:
+            world.calls.append("dry_write")
+
+        def is_alive(self) -> bool:
+            return self.arm.is_alive()
+
+        def alarm(self):
+            return self.arm.alarm()
+
+        def torque_off(self) -> None:
+            self.arm.torque_off()
+
     followers = _module("robots.followers", FollowerArm=FollowerArm)
 
     def return_to_home(arms, *, duration_s=0.0, sleep=None, **kw) -> bool:
         world.calls.append("home")
-        for _ in range(3):
+        world.home_calls += 1
+        for i in range(3):
+            if world.on_home_sleep is not None:
+                world.on_home_sleep(world.home_calls, i + 1)
             (sleep or (lambda dt: None))(0.0)
             world.home_sleeps += 1
         return True
@@ -174,6 +246,8 @@ def stub_dream(monkeypatch) -> StubWorld:
 
     def open_client(cfg):
         world.calls.append("open_client")
+        if world.on_open_client is not None:
+            world.on_open_client()
         return world.client
 
     rrun = _module(
@@ -181,7 +255,7 @@ def stub_dream(monkeypatch) -> StubWorld:
         make_cameras=lambda app: [SimpleNamespace(name="scene", frame=SimpleNamespace(data=None, timestamp_s=0.0),
                                                   start=lambda: None, stop=lambda: None,
                                                   set_exposure_hold=lambda on: None)],
-        make_kinematics=lambda app: None, open_client=open_client, DryRun=lambda arm: arm,
+        make_kinematics=lambda app: None, open_client=open_client, DryRun=DryArm,
         loop_settings=lambda app: {}, policy_config=lambda app, checkpoint: {"checkpoint": checkpoint},
         with_task=lambda cfg, task: cfg, TRAJ_WARMUP_S=1.0)
 
@@ -195,8 +269,9 @@ def stub_dream(monkeypatch) -> StubWorld:
         open_arm=open_arm, open_arm_read_only=None))
     rconfig = _module("robots.config", load=lambda path: SimpleNamespace(
         follower_l=None, follower_r=None, inference_log_path=None))
+    rtypes = _module("robots.types", ArmCommand=ArmCommand)
     robots = _module("robots", config=rconfig, control=control, followers=followers, home=home, run=rrun,
-                     bodies=bodies, errors=errors, arms_lock=arms_lock)
+                     bodies=bodies, errors=errors, arms_lock=arms_lock, types=rtypes)
     robots.__path__ = []
 
     class DebugView:
@@ -216,7 +291,7 @@ def stub_dream(monkeypatch) -> StubWorld:
 
     dream = _module("dream", DebugView=DebugView)
 
-    for mod in (robots, rconfig, control, followers, home, rrun, bodies, errors, arms_lock, dream):
+    for mod in (robots, rconfig, control, followers, home, rrun, bodies, errors, arms_lock, rtypes, dream):
         monkeypatch.setitem(sys.modules, mod.__name__, mod)
 
     # Stand-ins for the vision, the relay, the supervisor and the report: this file tests run_match's wiring.
@@ -248,13 +323,14 @@ class RecordingState(StateFile):
     def update(self, **fields):
         out = super().update(**fields)
         self.world.states.append(out)
+        self.world.order.append(f"state:{out['state']}")
         return out
 
 
-def run(world: StubWorld, tmp_path: Path, **kw):
+def run(world: StubWorld, tmp_path: Path, ctl: FreezeControl | None = None, dry_run: bool = False, **kw):
     state = RecordingState(tmp_path, world)
     match = MatchConfig(own_color="white")
-    coro = dream_executor.run_match(match, "ckpt", dry_run=False, out_dir=tmp_path, ctl=FreezeControl(),
+    coro = dream_executor.run_match(match, "ckpt", dry_run=dry_run, out_dir=tmp_path, ctl=ctl or FreezeControl(),
                                     state=state, **kw)
     return asyncio.run(coro)
 
@@ -358,3 +434,258 @@ def test_real_supervise_writes_stage(tmp_path, monkeypatch):
 
     asyncio.run(go())
     assert json.loads((tmp_path / "state.json").read_text())["stage"] == "stack"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Freeze and end. Real signals to this process (the handlers are the real ones); the arms are stubs.
+
+@pytest.fixture
+def ctl():
+    """A FreezeControl with the real SIGUSR1 handler; the previous handler comes back afterwards."""
+    old = signal.getsignal(signal.SIGUSR1)
+    control = FreezeControl()
+    control.install_freeze_signal()
+    yield control
+    signal.signal(signal.SIGUSR1, old)
+
+
+@pytest.fixture
+def fast_poll(monkeypatch):
+    monkeypatch.setattr(dream_executor, "FROZEN_POLL_S", 0.02)
+    monkeypatch.setattr(dream_executor, "ALARM_POLL_S", 0.04)
+
+
+def freeze(ctl: FreezeControl) -> None:
+    os.kill(os.getpid(), signal.SIGUSR1)
+    assert ctl.freeze.wait(5), "the freeze handler never ran"
+
+
+def end() -> None:
+    os.kill(os.getpid(), signal.SIGINT)
+
+
+def wait_for(cond, timeout=5.0):
+    until = time.monotonic() + timeout
+    while time.monotonic() < until:
+        if cond():
+            return True
+        time.sleep(0.005)
+    raise AssertionError("timed out")
+
+
+def has_state(world, name) -> bool:
+    return any(s["state"] == name for s in world.states)
+
+
+def in_thread(fn):
+    errors: list[BaseException] = []
+
+    def body():
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+            end()  # never leave run_match waiting
+    t = threading.Thread(target=body, daemon=True)
+    t.start()
+    return t, errors
+
+
+def finish_driver(t, errors):
+    t.join(10)
+    assert not errors, errors
+
+
+def after_frozen(order: list[str]) -> list[str]:
+    return order[order.index("state:frozen") + 1:]
+
+
+def test_freeze_before_open_arm_aborts_without_arms(stub_dream, tmp_path, ctl):
+    stub_dream.on_open_client = lambda: freeze(ctl)
+    run(stub_dream, tmp_path, ctl)
+    calls = stub_dream.calls
+    assert "open_arm" not in calls and "home" not in calls and "torque_off" not in calls
+    assert calls[-1] == "lock_released"
+    final = json.loads((tmp_path / "state.json").read_text())
+    assert final["state"] == "done" and final["error"] == "frozen before the arms opened"
+
+
+def test_freeze_after_open_arm_skips_startup_home(stub_dream, tmp_path, ctl, fast_poll):
+    class Opener(dict):
+        def __setitem__(self, k, v):
+            super().__setitem__(k, v)
+            if len(self) == 2:
+                freeze(ctl)  # the freeze lands as the second arm opens
+    stub_dream.arms = Opener()
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    assert stub_dream.order.index("state:frozen") < stub_dream.order.index("home")  # the only home is the end one
+    assert stub_dream.calls.count("home") == 1
+
+
+def test_freeze_during_startup_home_holds_no_torque_off(stub_dream, tmp_path, ctl, fast_poll):
+    stub_dream.on_home_sleep = lambda n, i: freeze(ctl) if (n, i) == (1, 2) else None
+    snap: dict = {}
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        time.sleep(0.2)
+        snap["order"] = list(stub_dream.order)
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    before = snap["order"]
+    assert before.count("write") == 2 and "torque_off" not in before and "state:running" not in before
+    assert before.index("home") < before.index("state:frozen")
+    tail = [e for e in after_frozen(stub_dream.order) if e in ("state:homing", "home", "state:parking",
+                                                                "torque_off", "state:done")]
+    # the held arms were commanded once each before the end (2 writes), then the end path ran
+    assert tail == ["state:homing", "home", "state:parking", "torque_off", "torque_off", "state:done"]
+    assert stub_dream.calls.count("write") == 2
+
+
+def test_freeze_during_loop_holds_until_end(stub_dream, tmp_path, ctl):
+    stub_dream.finish = False
+    snap: dict = {}
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        time.sleep(0.1)
+        freeze(ctl)
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        mark = len(stub_dream.order)
+        time.sleep(1.0)
+        snap["quiet"] = stub_dream.order[mark:]
+        snap["order"] = list(stub_dream.order)
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    order = snap["order"]
+    assert order.index("loop_exit") < order.index("state:frozen")  # frozen only once the loop let go
+    assert snap["quiet"] == []  # nothing touched the arms or the state for 1 s
+    assert order.count("write") == 2 and "torque_off" not in order and order.count("home") == 1  # start-up home only
+    assert stub_dream.states[-1]["state"] == "done"
+
+
+def test_end_then_freeze_during_end_home_does_not_fall_through(stub_dream, tmp_path, ctl, fast_poll):
+    stub_dream.finish = False
+    stub_dream.on_home_sleep = lambda n, i: freeze(ctl) if (n, i) == (2, 2) else None
+    snap: dict = {}
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        end()
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        time.sleep(0.3)  # the SIGINT's end request was cancelled by the freeze: it must not end the run
+        snap["order"] = list(stub_dream.order)
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    order = snap["order"]
+    assert order.index("state:homing") < order.index("state:frozen")
+    assert "torque_off" not in order and "state:parking" not in order
+    tail = [e for e in after_frozen(stub_dream.order) if e in ("state:homing", "home", "state:parking",
+                                                                "torque_off", "state:done")]
+    assert tail == ["state:homing", "home", "state:parking", "torque_off", "torque_off", "state:done"]
+    assert stub_dream.calls.count("write") == 2  # one measured hold per arm, for the one freeze
+
+
+def test_alarm_while_frozen_is_recorded_and_still_holds(stub_dream, tmp_path, ctl, fast_poll):
+    stub_dream.finish = False
+    snap: dict = {}
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        freeze(ctl)
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        stub_dream.alarm = "joint 3 at 70 C"
+        state_path = tmp_path / "state.json"
+        wait_for(lambda: json.loads(state_path.read_text()).get("alarm"))
+        time.sleep(0.2)
+        snap["state"] = json.loads(state_path.read_text())
+        snap["order"] = list(stub_dream.order)
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    assert snap["state"]["state"] == "frozen" and "70 C" in snap["state"]["alarm"]
+    assert "torque_off" not in snap["order"] and snap["order"].count("write") == 2
+
+
+def test_hold_failure_is_written_as_alarm(stub_dream, tmp_path, ctl, fast_poll, monkeypatch):
+    stub_dream.finish = False
+    snap: dict = {}
+
+    def boom(self, cmd):
+        raise OSError("bus off")
+    monkeypatch.setattr(StubArm, "write", boom)
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        freeze(ctl)
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        snap["state"] = json.loads((tmp_path / "state.json").read_text())
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    assert snap["state"]["state"] == "frozen" and "bus off" in snap["state"]["alarm"]
+
+
+def test_end_request_cancelled_by_freeze_in_frozen_wait_keeps_holding(stub_dream, tmp_path, ctl, fast_poll,
+                                                                      monkeypatch):
+    # begin_end() False (a freeze landed between the end request and the poll): back to waiting, no home move.
+    stub_dream.finish = False
+    real = ctl.begin_end
+    seen: list[bool] = []
+
+    def begin_end():
+        ctl.end_requested.clear()  # as the SIGUSR1 handler does
+        seen.append(real())
+        return seen[-1]
+    monkeypatch.setattr(ctl, "begin_end", begin_end)
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        freeze(ctl)
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        end()  # begin_end answers False for this one
+        wait_for(lambda: bool(seen))
+        time.sleep(0.2)
+        assert "state:homing" not in after_frozen(stub_dream.order) and "torque_off" not in stub_dream.order
+        monkeypatch.setattr(ctl, "begin_end", real)
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    assert seen == [False]
+    assert "state:homing" in after_frozen(stub_dream.order)
+
+
+def test_dry_run_freeze_and_end(stub_dream, tmp_path, ctl, fast_poll):
+    stub_dream.finish = False
+    snap: dict = {}
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        freeze(ctl)
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        time.sleep(0.1)
+        snap["order"] = list(stub_dream.order)
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl, dry_run=True)
+    finish_driver(t, errors)
+    assert "torque_off" not in snap["order"]
+    assert "write" not in stub_dream.calls and "home" not in stub_dream.calls  # nothing moved, nothing homed
+    assert stub_dream.calls.count("dry_write") == 2
+    assert stub_dream.calls.count("torque_off") == 2  # the DryRun close, on the end path only
+    assert stub_dream.states[-1]["state"] == "done"
