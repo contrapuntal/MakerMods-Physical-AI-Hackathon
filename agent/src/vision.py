@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 
 import aiohttp
@@ -191,13 +192,104 @@ async def _refresh_trip(base: str, sess) -> None:
     _trip_cache = (now, n, trip, base)
 
 
+# ---- station view over ssh: only the newest frame of one camera crosses the network ----
+# A /trip/<n> holds every camera's frame window (1 MB and more); over the event Wi-Fi (0.23 MB/s measured) that took
+# 5-20 s through the tunnel. Picked on the station instead, one frame is ~70 KB: 0.3-0.6 s over the helper's own
+# ControlMaster connection. Nothing is installed or written on the station: the script goes on stdin, stdlib only.
+STATION_SSH_TIMEOUT_S = 4.0
+STATION_VIEW_ON_HOST = "http://127.0.0.1:8093"  # Dream's DebugView, as the station itself reaches it
+_SSH_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_SSH_FRAME_SCRIPT = r'''
+import json, sys, urllib.request
+base, keys = sys.argv[1], sys.argv[2:]
+def get(path, timeout):
+    return json.load(urllib.request.urlopen(base + path, timeout=timeout))
+try:
+    trips = get("/trips", 2)
+except Exception as exc:
+    sys.stderr.write(f"station view unreachable: {exc!r}"); sys.exit(3)
+if not isinstance(trips, list) or not trips or not isinstance(trips[-1], dict) or "n" not in trips[-1]:
+    sys.stderr.write("station view has no round trips yet"); sys.exit(4)
+n = int(trips[-1]["n"])
+try:
+    frames = get(f"/trip/{n}", 3).get("frames") or {}
+except Exception as exc:
+    sys.stderr.write(f"station view unreachable: {exc!r}"); sys.exit(3)
+for key in keys:
+    value = frames.get(key)
+    if isinstance(value, str):
+        value = [value]
+    if value:
+        sys.stdout.write(f"{n} {key} {value[-1]}"); sys.exit(0)
+sys.stderr.write("station view has no frame for " + ", ".join(keys)); sys.exit(5)
+'''
+
+
+def station_ssh_host() -> str | None:
+    """CAMERA_STATION_SSH: the ssh host whose 127.0.0.1:8093 view to read frame by frame; unset = the tunnel URL."""
+    host = (os.environ.get("CAMERA_STATION_SSH") or "").strip()
+    return host or None
+
+
+def _ssh_frame_argv(host: str, keys: tuple[str, ...]) -> list[str]:
+    if not _SSH_HOST_RE.fullmatch(host):
+        raise CameraDown(f"bad CAMERA_STATION_SSH host {host!r}")
+    sock = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "pah2026-helper-%h.sock")  # the helper's master
+    opts = ["BatchMode=yes", "ConnectTimeout=3", "ControlMaster=auto", f"ControlPath={sock}", "ControlPersist=10m",
+            "ServerAliveInterval=2", "ServerAliveCountMax=2"]
+    return ["ssh", *[x for o in opts for x in ("-o", o)], "--", host, "python3", "-", STATION_VIEW_ON_HOST, *keys]
+
+
+async def _run_ssh(argv: list[str], script: str) -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        out, err = await proc.communicate(script.encode())
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+        raise
+    return proc.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
+
+
+async def fetch_station_ssh(role: str, host: str) -> bytes:
+    """Newest frame for a role, picked on the station and sent over ssh. Same staleness rule as fetch_station."""
+    global _station_stale
+    try:
+        rc, out, err = await asyncio.wait_for(
+            _run_ssh(_ssh_frame_argv(host, STATION_KEYS[role]), _SSH_FRAME_SCRIPT), STATION_SSH_TIMEOUT_S
+        )
+    except (TimeoutError, OSError) as exc:
+        raise CameraDown(f"station view over ssh: {exc!r}") from exc
+    if rc != 0:
+        raise CameraDown((err.strip() or f"station view over ssh: exit {rc}")[:200])
+    try:
+        n_text, _key, b64 = out.split(" ", 2)
+        n, jpeg = int(n_text), base64.b64decode(b64, validate=True)
+    except ValueError as exc:
+        raise CameraDown("station view over ssh: malformed reply") from exc
+    seen_key, now = f"ssh:{host}", time.monotonic()
+    if seen_key not in _seen or _seen[seen_key][0] != n:
+        _seen[seen_key] = (n, now)  # new trip number: restart the staleness clock (laptop clock only)
+    if now - _seen[seen_key][1] >= stale_after_s():
+        _station_stale = True
+        raise CameraDown(STATION_STALE_MSG)
+    _station_stale = False
+    return jpeg
+
+
 async def fetch_station(role: str, base_url: str | None = None, session=None) -> bytes:
     """Newest station frame for a role. Concurrent callers share one refresh (same trip for all roles).
 
     Raises CameraDown if the newest trip number has not changed for CAMERA_STATION_STALE_S (default 3 s): the
-    debug view keeps old trips and only adds new ones while a Dream run is active.
+    debug view keeps old trips and only adds new ones while a Dream run is active. With CAMERA_STATION_SSH set (and no
+    explicit base_url) the frame is picked on that host and sent over ssh instead (fetch_station_ssh).
     """
     global _station_stale
+    host = station_ssh_host()
+    if host and base_url is None:
+        return await fetch_station_ssh(role, host)
     base = (base_url or station_url()).rstrip("/")
     async with _lock():
         c = _trip_cache

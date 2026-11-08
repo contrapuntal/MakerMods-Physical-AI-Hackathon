@@ -271,6 +271,9 @@ BANNER
     if [ -n "$agent_checkpoint" ]; then echo "checkpoint: $agent_checkpoint (one model for all stages)"; else echo "checkpoint: per-stage defaults"; fi
   fi
   echo "Match clock: HARNESS_TIME_LIMIT=${HARNESS_TIME_LIMIT} s: the run does NOT end by itself; freeze, let the referee score, then end the run."
+  # Cameras: in harness mode pick the newest frame on the station and send just that over ssh (~70 KB, <1 s);
+  # the tunnel URL needs the whole round trip (1 MB+, 5-20 s on the event Wi-Fi). CAMERA_STATION_SSH= turns it off.
+  if [ "$backend" = harness ]; then camera_ssh="${CAMERA_STATION_SSH-$HARNESS_HOST}"; else camera_ssh="${CAMERA_STATION_SSH-}"; fi
   (
     set -a
     # shellcheck disable=SC1091
@@ -289,6 +292,7 @@ BANNER
       CAMERA_SOURCE=auto \
       CAMERA_SOURCE_URL="$CAMERA_SOURCE_URL" \
       CAMERA_STATION_URL="$CAMERA_STATION_URL" \
+      CAMERA_STATION_SSH="$camera_ssh" \
       "${extra_env[@]}" \
       lk agent dev --no-reload
   )

@@ -9,7 +9,12 @@ working repo, so the hackathon repo holds everything the demo uses.
 
 The agent never opens the station's cameras. It reads the frames Dream-1 already gets, from Dream's DebugView page,
 which the harness serves on nuck-3's `127.0.0.1:8093` while a run is active (`harness/dream_executor.py`, `VIEW_PORT`).
-The laptop reaches it through an SSH tunnel:
+
+- **How frames reach the laptop:** in harness mode each look asks nuck-3 over SSH for just the newest frame of the
+  camera it needs (`CAMERA_STATION_SSH`, set by the launcher). That's about 70 KB and well under a second. A small
+  standard-library script goes on stdin; nothing is installed or written on the station. Downloading the whole round
+  trip through the tunnel instead is 1 MB or more, which took 5-20 s on the event Wi-Fi.
+- **Turning it off:** `CAMERA_STATION_SSH=` (empty) falls back to the tunnel.
 
 - **Frames go through privacy masking first.** The top of each frame is greyed out, then faces are blurred (YuNet),
   before anything is logged or sent to the vision model (`src/vision.py`).
@@ -21,18 +26,20 @@ The laptop reaches it through an SSH tunnel:
 
 ```bash
 cd agent
-uv sync                                   # Python 3.12; torch comes from the CPU index
+uv sync                     # Python 3.12; torch comes from the CPU index
 # Put LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET in the environment (never in a file in the repo).
-ops/tunnels.sh up                         # SSH forwards to nuck-3: 8080, 8091, 8093 (127.0.0.1 only)
 
-ops/voice-agent.sh --backend fake         # local test against a fake harness: nothing moves
-ops/voice-agent.sh --backend harness --check   # preflight on the station (read-only)
-ops/voice-agent.sh --backend harness      # dry run: voice start runs `harness run --dry-run`
+ops/run-voice.sh            # dry run (default): voice start runs `harness run --dry-run`; nothing moves
+ops/run-voice.sh --check    # preflight on the station (read-only)
+ops/run-voice.sh --fake     # local test against a fake harness: no station at all
+ops/run-voice.sh --stop     # stop the agent (Ctrl-C in its terminal does the same)
 ```
 
-- **Connecting:** add `LIVEKIT_AGENT_DEPLOYMENT=production` so the LiveKit Agent Console reaches the agent. Connect to
-  `pah2026-robot-<hostname>` (or set `AGENT_NAME`).
-- **Live motion** (`--live`) is for a person at the station only. The launcher asks for a typed confirmation, and
+- **What `ops/run-voice.sh` does:** brings the SSH tunnels up (`ops/tunnels.sh`), refuses to start a second copy of
+  the agent, sets `LIVEKIT_AGENT_DEPLOYMENT=production` and the team's `HARNESS_RUN_ARGS`, then runs
+  `ops/voice-agent.sh`.
+- **Connecting:** in the LiveKit Agent Console, connect to `pah2026-robot-<hostname>` (or set `AGENT_NAME`).
+- **Live motion** (`ops/run-voice.sh --live`) is for a person at the station only. The launcher asks for a typed confirmation, and
   someone must be at the nuck-3 keyboard to press Ctrl-C.
 
 ## Voice start, freeze and end need the voice-freeze harness
@@ -54,5 +61,6 @@ ops/voice-agent.sh --backend harness      # dry run: voice start runs `harness r
 | `VISION_MODEL`, `VISION_FALLBACK_MODEL` | `google/gemini-3.6-flash`, `google/gemini-3.8-flash` | camera answers; `off` disables the fallback |
 | `AGENT_LLM` | LiveKit Inference | `AGENT_LLM=omlx` uses an OpenAI-compatible server instead: `OMLX_BASE_URL`, `OMLX_MODEL`, `OMLX_API_KEY` |
 | `TUNNEL_HOST` | `nuck-3` | the SSH host `ops/tunnels.sh` forwards to |
+| `CAMERA_STATION_SSH` | `HARNESS_HOST` in harness mode | the host to fetch frames from over SSH; empty = the tunnel |
 
 `docs/voice-commands.md` has every voice command, every spoken line and the harness prompts per stage.
