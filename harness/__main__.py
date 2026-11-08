@@ -33,7 +33,9 @@ def main(argv: list[str] | None = None) -> None:
     r = sub.add_parser("run", help="run the three-stage relay",
                        description="Run the three-stage relay. SIGUSR1 freezes the arms in place (no home, no "
                                    "switch-off); SIGINT/SIGTERM ends the run.")
-    r.add_argument("--color", required=True, help="our ping-pong ball colour from the coin flip")
+    r.add_argument("--color", default=None,
+                   help="our ping-pong ball colour from the coin flip (optional: omit to bin every ball except "
+                        "the avoid (white) balls)")
     r.add_argument("--checkpoint", default=DEFAULT_MODEL, help="the Dream model (a fine-tune's id, or base Dream-1)")
     r.add_argument("--dry-run", action="store_true", help="Dream-1 plans; nothing is written to the arms")
     r.add_argument("--unplug-text", default=None,
@@ -137,7 +139,7 @@ def _dispatch(args: argparse.Namespace, ctl: FreezeControl | None, state: StateF
     by_spoken = {c.split("_")[0]: c for c in cal.ball_colors}
     if args.color in by_spoken:
         args.color = by_spoken[args.color]  # "--color green" means the green_ball calibration
-    if args.color not in cal.ball_colors:
+    if args.color is not None and args.color not in cal.ball_colors:
         sys.exit(f"--color {args.color!r} is not one of the ball colours {sorted(by_spoken)}")
     match = MatchConfig(own_color=args.color, time_limit_s=args.time_limit, calibration=cal,
                         rod_first=not args.rod_on_tower,

@@ -191,7 +191,9 @@ def test_main_help_text():
     )
     res = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True, text=True, timeout=60)
     assert res.returncode == 0, res.stderr
-    assert "SIGUSR1 freezes the arms" in " ".join(res.stdout.split())
+    helptext = " ".join(res.stdout.split())
+    assert "SIGUSR1 freezes the arms" in helptext
+    assert "omit to bin every ball except" in helptext
 
 
 def test_state_update_survives_unserialisable_value(tmp_path):

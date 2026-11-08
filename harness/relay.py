@@ -127,7 +127,8 @@ class Relay:
 
     def score(self) -> int:
         pts = (10 if "unplug" in self.passed else 0) + (20 if "stack" in self.passed else 0)
-        return pts + 5 * self.own_in_bin - 5 * self.other_in_bin
+        other = 5 * self.other_in_bin if self.m.other_color() else 0
+        return pts + 5 * self.own_in_bin - other
 
     # ------------------------------------------------------------------ the match
     def start(self, world: World, t: float) -> None:
@@ -168,8 +169,8 @@ class Relay:
             self._released_since_start, self._gripper_was_closed = False, False
             self.hold_from_s = t if step.kind == "hold" else None
             self.pending_confirm, self._confirmed = None, False
-            self._own_at_start = len(world.balls_in_bin(self.m.own_color))
-            self._other_at_start = len(world.balls_in_bin(self.m.other_color()))
+            self._own_at_start = self._own_in_bin(world)
+            self._other_at_start = self._other_in_bin(world)
             self.log(t, f"step {step.kind} #{self.attempts[key]}: {step.instruction!r}")
         return step
 
@@ -350,7 +351,7 @@ class Relay:
             return Step("balls", "take_out", "take the black ball out of the bin and put it on the table",
                         "eight_ball", self.m.step_timeout_s, needs_release=True)
         other = self.m.other_color()
-        if world.balls_in_bin(other) and self.time_left(t) > 20:
+        if other and world.balls_in_bin(other) and self.time_left(t) > 20:
             return Step("balls", "take_out", f"take the {spoken(other)} ping-pong ball out of the bin and put it on "
                         "the table", other, self.m.step_timeout_s)
         for white in world.avoid_in_bin():
@@ -358,15 +359,27 @@ class Relay:
                 return Step("balls", "take_out", f"take the {spoken(white.color)} ping-pong ball out of the bin and "
                             "put it on the table", white.color, self.m.step_timeout_s)
         eight, avoid = world.of("eight_ball"), world.of("avoid_ball")
-        candidates = [b for b in world.balls_on_table(self.m.own_color)
+        on_table = [b for c in self._our_colours() for b in world.balls_on_table(c)]
+        candidates = [b for b in on_table
                       if world.nearest_cm(b, eight) >= self.m.clear_of_eight_cm
                       and world.nearest_cm(b, avoid) >= self.m.clear_of_avoid_cm]
         if not candidates:
-            if world.balls_on_table(self.m.own_color):
+            if on_table:
                 self.log(t, "every own-colour ball left is next to a black or white ball; waiting")
             return Step("balls", "park", PARK, "none", 3.0, needs_release=False, confirm_polls=99)
-        return Step("balls", "ball", f"pick up the {spoken(self.m.own_color)} ping-pong ball and drop it in the bin "
-                    f"{AVOID['balls']}", self.m.own_color, self.m.step_timeout_s)
+        target = self.m.own_color or candidates[0].color
+        return Step("balls", "ball", f"pick up the {spoken(target)} ping-pong ball and drop it in the bin "
+                    f"{AVOID['balls']}", target, self.m.step_timeout_s)
+
+    def _our_colours(self) -> list[str]:
+        return [self.m.own_color] if self.m.own_color else list(self.cal.ball_colors)
+
+    def _own_in_bin(self, world: World) -> int:
+        return sum(len(world.balls_in_bin(c)) for c in self._our_colours())
+
+    def _other_in_bin(self, world: World) -> int:
+        other = self.m.other_color()
+        return len(world.balls_in_bin(other)) if other else 0
 
     # ------------------------------------------------------------------ checks
     def _check(self, step: Step, world: World, t: float) -> bool:
@@ -396,7 +409,7 @@ class Relay:
                 self.hold_from_s = t  # restart the 3 s whenever the tower is not seen standing
             return self.hold_from_s is not None and t - self.hold_from_s >= self.m.hold_s
         if step.kind == "ball":
-            return len(world.balls_in_bin(self.m.own_color)) > self._own_at_start
+            return self._own_in_bin(world) > self._own_at_start
         if step.kind == "take_out":
             if step.target == "eight_ball":
                 return not world.eight_ball_in_bin()
@@ -428,7 +441,7 @@ class Relay:
         elif step.kind == "hold":
             self._advance(t, f"tower {self.height_in():.1f} in, standing {self.m.hold_s:.0f} s")
         elif step.kind in ("ball", "take_out"):
-            self.own_in_bin = len(world.balls_in_bin(self.m.own_color))
-            self.other_in_bin = len(world.balls_in_bin(self.m.other_color()))
+            self.own_in_bin = self._own_in_bin(world)
+            self.other_in_bin = self._other_in_bin(world)
             self.log(t, f"bin: {self.own_in_bin} own, {self.other_in_bin} other; score {self.score()}")
         self.step = None
