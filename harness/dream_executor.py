@@ -74,8 +74,17 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
     stop = asyncio.Event()
     aloop = asyncio.get_running_loop()
     ctl.on_freeze = lambda: aloop.call_soon_threadsafe(stop.set)  # only wakes the loop: no arm or file work here
+    # The end signals use signal.signal like SIGUSR1 (not loop.add_signal_handler, whose callback is deferred until
+    # the loop runs): both run at once on the main thread, so an end and a freeze keep the order they arrived in.
+    def _on_end_signal(signum, frame) -> None:
+        ctl.request_end()  # first: the event is reentrant and needs no loop
+        try:
+            aloop.call_soon_threadsafe(stop.set)
+        except RuntimeError:  # the loop is closed
+            pass
+
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        aloop.add_signal_handler(signum, lambda: (stop.set(), ctl.request_end()))
+        lock.callback(signal.signal, signum, signal.signal(signum, _on_end_signal))  # restored as the lock closes
 
     relay = Relay(match)
     app = rrun.with_task(rconfig.load(station_config), "hold the arms still")
@@ -86,6 +95,7 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
     view = None
     error: str | None = None
     done_error: str | None = None  # a clean abort: written with state "done"
+    fault: Exception | None = None
     try:
         readers = await asyncio.to_thread(rrun.make_cameras, app)
         kin = rrun.make_kinematics(app)
@@ -101,6 +111,7 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
             _log.warning("debug view cannot listen on port %d (%s); carrying on without it", VIEW_PORT, exc)
         if ctl.frozen:  # a freeze while the harness was starting: the arms are never opened
             done_error = "frozen before the arms opened"
+            relay.log(time.monotonic(), done_error)
             return relay
         open_arm = body.open_arm_read_only if dry_run and body.open_arm_read_only is not None else body.open_arm
         for name, arm_cfg in (("left", app.follower_l), ("right", app.follower_r)):
@@ -136,14 +147,18 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         # Dream-1 answered in up to ~4.3 s in practice: don't throw such a chunk away, and ride out a 20 s gap.
         settings["action_timeout_s"] = max(settings.get("action_timeout_s") or 0, 5.0)
         settings["max_stall_ticks"] = max(settings.get("max_stall_ticks") or 0, 400)
-        fault: Exception | None = None
         restarts = 0
         _set_state(state, state="running", stage=relay.stage)
         claude = ClaudeVerifier()
         problem = await asyncio.to_thread(claude.probe)
         if problem:
             _log.warning("Claude vision checks off: %s", problem)
-        while not stop.is_set():
+        if ctl.frozen:
+            raise FreezeRequested  # frozen during the probe: never start the loop
+        def halted() -> bool:  # a freeze flips the flag at once; stop follows when the loop next runs
+            return stop.is_set() or ctl.frozen
+
+        while not halted():
             task = relay.step.instruction if relay.step else step.instruction
             loop = control.ControlLoop(followers=arms, cameras=readers, client=client, task=task,
                                        kinematics=kin, inference_log_path=app.inference_log_path, camera_owner=False,
@@ -175,6 +190,8 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                 if restarts > 3 or left < match.stop_margin_s + 15:
                     fault = exc
                     break
+                if halted():  # a freeze or an end arrived: no camera work now
+                    break
                 readers = await _reopen_cameras(rrun, app, readers, deadline_s=min(12.0, left - match.stop_margin_s))
                 if readers is None:
                     fault = exc
@@ -191,7 +208,8 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                                                 f"holding, retry in 3 s with {left:.0f} s left")
                     if left < match.stop_margin_s + 5:
                         break
-                    await asyncio.sleep(3.0)
+                    with contextlib.suppress(TimeoutError):  # stop-aware: a freeze must not wait out the pause
+                        await asyncio.wait_for(stop.wait(), 3.0)
                     continue
                 # Dream-1 stopped answering for a while (the loop's stall guard). The arms hold; while the match
                 # clock has time left, open a fresh loop and carry on from the same step.
@@ -200,6 +218,8 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                 if restarts > 3 or left < match.stop_margin_s + 10:
                     fault = exc
                     break
+                if halted():
+                    break  # a freeze or an end arrived: no restart work now
                 client = await asyncio.to_thread(rrun.open_client, dream_config)
                 if view is not None:
                     view.watch(client)  # keep the :8093 page following the new client
@@ -215,12 +235,17 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         if not dry_run:
             await asyncio.to_thread(home.return_to_home, arms, duration_s=home.HOME_DURATION_S,
                                     sleep=ctl.interruptible_sleep)
+        if ctl.frozen:
+            raise FreezeRequested  # a freeze landed as the move finished
         if fault is not None:
             raise fault
     except FreezeRequested:
         # Never an error: hold the arms, wait for an end request, then home. A freeze must not reach the caller.
+        relay.log(time.monotonic(), f"frozen at stage {relay.stage}")
         try:
-            await _frozen_wait(arms, ctl, state, stop, home, rtypes, dry_run)
+            await _frozen_wait(arms, ctl, state, home, rtypes, dry_run)
+            if fault is not None:
+                raise fault  # the loop's fault is still the reason this run ends
         except BaseException as exc:
             error = str(exc) or type(exc).__name__
             raise
@@ -228,7 +253,8 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         error = str(exc) or type(exc).__name__
         raise
     finally:
-        _set_state(state, state="parking")
+        if arms:
+            _set_state(state, state="parking")
         for reader in readers:
             reader.stop()
         if view is not None:
@@ -253,8 +279,7 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
     return relay
 
 
-async def _frozen_wait(arms: dict, ctl: FreezeControl, state, stop: asyncio.Event, home, rtypes,
-                       dry_run: bool) -> None:
+async def _frozen_wait(arms: dict, ctl: FreezeControl, state, home, rtypes, dry_run: bool) -> None:
     """Holds the arms where they are until an end is requested, then homes. Returns once the end move is done.
 
     The arms are commanded their own measured pose once (the driver's hold tick keeps it from there); there is no
@@ -291,6 +316,8 @@ async def _frozen_wait(arms: dict, ctl: FreezeControl, state, stop: asyncio.Even
                                         sleep=ctl.interruptible_sleep)
         except FreezeRequested:
             continue  # frozen again mid-move: hold the pose it reached
+        if ctl.frozen:
+            continue  # a freeze landed as the move finished
         return
 
 

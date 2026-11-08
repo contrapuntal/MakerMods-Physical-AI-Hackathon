@@ -59,6 +59,9 @@ class StubWorld:
         self.order: list[str] = []  # calls and "state:<name>" writes, in order
         self.calls: list[str] = _Tee(self.order)
         self.on_open_client = None  # called inside open_client (a worker thread)
+        self.on_open_arm = None  # called inside open_arm, on the event loop thread
+        self.on_home_done = None  # called as (home_call_no) after a home move's last sleep
+        self.ik_calls = 0
         self.on_home_sleep = None  # called as (home_call_no, sleep_no) inside each home move's sleeps
         self.home_calls = 0
         self.loop_exits = 0
@@ -75,7 +78,10 @@ class StubWorld:
         self.finish = True  # the stub supervisor ends the relay at once
         self.arms: dict = {}
         self.home_sleeps = 0
-        self.client = SimpleNamespace(name="client", wait_for_ik=lambda t: True)
+        self.client = SimpleNamespace(name="client", wait_for_ik=self._wait_for_ik)
+
+
+StubWorld._wait_for_ik = lambda self, t: (setattr(self, "ik_calls", self.ik_calls + 1), True)[1]
 
 
 class StubArm:
@@ -240,6 +246,8 @@ def stub_dream(monkeypatch) -> StubWorld:
                 world.on_home_sleep(world.home_calls, i + 1)
             (sleep or (lambda dt: None))(0.0)
             world.home_sleeps += 1
+        if world.on_home_done is not None:
+            world.on_home_done(world.home_calls)
         return True
 
     home = _module("robots.home", return_to_home=return_to_home, HOME_DURATION_S=1.0)
@@ -261,6 +269,8 @@ def stub_dream(monkeypatch) -> StubWorld:
 
     def open_arm(cfg, name):
         world.calls.append("open_arm")
+        if world.on_open_arm is not None:
+            world.on_open_arm()
         arm = StubArm(world, name)
         world.arms[name] = arm
         return arm
@@ -327,12 +337,19 @@ class RecordingState(StateFile):
         return out
 
 
+_running = threading.Event()  # set while run_match runs: driver threads send SIGINT only then
+
+
 def run(world: StubWorld, tmp_path: Path, ctl: FreezeControl | None = None, dry_run: bool = False, **kw):
     state = RecordingState(tmp_path, world)
     match = MatchConfig(own_color="white")
     coro = dream_executor.run_match(match, "ckpt", dry_run=dry_run, out_dir=tmp_path, ctl=ctl or FreezeControl(),
                                     state=state, **kw)
-    return asyncio.run(coro)
+    _running.set()
+    try:
+        return asyncio.run(coro)
+    finally:
+        _running.clear()
 
 
 def test_holds_arms_lock_for_whole_run(stub_dream, tmp_path):
@@ -485,7 +502,8 @@ def in_thread(fn):
             fn()
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
-            end()  # never leave run_match waiting
+            if _running.is_set():
+                end()  # never leave run_match waiting (but never SIGINT a pytest that is no longer in run_match)
     t = threading.Thread(target=body, daemon=True)
     t.start()
     return t, errors
@@ -506,6 +524,7 @@ def test_freeze_before_open_arm_aborts_without_arms(stub_dream, tmp_path, ctl):
     calls = stub_dream.calls
     assert "open_arm" not in calls and "home" not in calls and "torque_off" not in calls
     assert calls[-1] == "lock_released"
+    assert "state:parking" not in stub_dream.order  # no arms: nothing to park
     final = json.loads((tmp_path / "state.json").read_text())
     assert final["state"] == "done" and final["error"] == "frozen before the arms opened"
 
@@ -550,8 +569,10 @@ def test_freeze_during_startup_home_holds_no_torque_off(stub_dream, tmp_path, ct
     assert stub_dream.calls.count("write") == 2
 
 
-def test_freeze_during_loop_holds_until_end(stub_dream, tmp_path, ctl):
+def test_freeze_during_loop_holds_until_end(stub_dream, tmp_path, ctl, monkeypatch):
     stub_dream.finish = False
+    logs: list[str] = []
+    monkeypatch.setattr(StubRelay, "log", lambda self, t, what: logs.append(what))
     snap: dict = {}
 
     def driver():
@@ -569,6 +590,8 @@ def test_freeze_during_loop_holds_until_end(stub_dream, tmp_path, ctl):
     finish_driver(t, errors)
     order = snap["order"]
     assert order.index("loop_exit") < order.index("state:frozen")  # frozen only once the loop let go
+    assert order.index("loop_exit") < order.index("write")  # ... and the first measured write comes after it
+    assert "frozen at stage unplug" in logs  # the report records the freeze
     assert snap["quiet"] == []  # nothing touched the arms or the state for 1 s
     assert order.count("write") == 2 and "torque_off" not in order and order.count("home") == 1  # start-up home only
     assert stub_dream.states[-1]["state"] == "done"
@@ -644,6 +667,7 @@ def test_end_request_cancelled_by_freeze_in_frozen_wait_keeps_holding(stub_dream
                                                                       monkeypatch):
     # begin_end() False (a freeze landed between the end request and the poll): back to waiting, no home move.
     stub_dream.finish = False
+    snap: dict = {}
     real = ctl.begin_end
     seen: list[bool] = []
 
@@ -661,12 +685,14 @@ def test_end_request_cancelled_by_freeze_in_frozen_wait_keeps_holding(stub_dream
         wait_for(lambda: bool(seen))
         time.sleep(0.2)
         assert "state:homing" not in after_frozen(stub_dream.order) and "torque_off" not in stub_dream.order
+        snap["writes"] = stub_dream.calls.count("write")
         monkeypatch.setattr(ctl, "begin_end", real)
         end()
     t, errors = in_thread(driver)
     run(stub_dream, tmp_path, ctl)
     finish_driver(t, errors)
     assert seen == [False]
+    assert snap["writes"] == 4  # the first hold (2 arms) plus one re-hold when the end request was cancelled
     assert "state:homing" in after_frozen(stub_dream.order)
 
 
@@ -689,3 +715,140 @@ def test_dry_run_freeze_and_end(stub_dream, tmp_path, ctl, fast_poll):
     assert stub_dream.calls.count("dry_write") == 2
     assert stub_dream.calls.count("torque_off") == 2  # the DryRun close, on the end path only
     assert stub_dream.states[-1]["state"] == "done"
+
+
+def test_end_then_freeze_in_the_same_busy_moment_stays_frozen(stub_dream, tmp_path, ctl, fast_poll):
+    # SIGINT then SIGUSR1 while the loop thread is blocked in open_arm: both handlers run at once, in order, so the
+    # freeze wins. (A deferred end handler would set end_requested again after the freeze cleared it.)
+    started = threading.Event()
+
+    def slow_open():
+        if not started.is_set():
+            started.set()
+            time.sleep(0.4)
+    stub_dream.on_open_arm = slow_open
+    snap: dict = {}
+
+    def driver():
+        assert started.wait(5)
+        end()
+        time.sleep(0.05)
+        freeze(ctl)
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        time.sleep(0.3)
+        snap["order"] = list(stub_dream.order)
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    order = snap["order"]
+    assert "state:frozen" in order and "torque_off" not in order and "state:parking" not in order
+    assert "home" not in order  # never homed before the second end
+    assert "state:homing" not in order
+
+
+def test_freeze_again_inside_frozen_wait_end_home(stub_dream, tmp_path, ctl, fast_poll):
+    stub_dream.finish = False
+    # home call 1 is the start-up one; call 2 is the end move started from the frozen wait.
+    stub_dream.on_home_sleep = lambda n, i: freeze(ctl) if (n, i) == (2, 2) else None
+    snap: dict = {}
+
+    def frozen_count():
+        return sum(1 for s in stub_dream.states if s["state"] == "frozen")
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        freeze(ctl)
+        wait_for(lambda: frozen_count() == 1)
+        end()
+        wait_for(lambda: frozen_count() == 2)
+        time.sleep(0.2)
+        snap["order"] = list(stub_dream.order)
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    order = snap["order"]
+    assert "state:parking" not in order and "torque_off" not in order
+    assert order.count("write") == 4 and order.count("home") == 2  # two holds; start-up and the interrupted end move
+    tail = [e for e in after_frozen(after_frozen(stub_dream.order))
+            if e in ("state:homing", "home", "state:parking", "torque_off", "state:done")]
+    assert tail == ["state:homing", "home", "state:parking", "torque_off", "torque_off", "state:done"]
+
+
+def test_freeze_during_person_in_scene_pause_is_prompt(stub_dream, tmp_path, ctl, monkeypatch):
+    stub_dream.finish = False
+    stub_dream.loop_error = RuntimeError("unsafe instruction in this scene")
+    logs: list[str] = []
+    monkeypatch.setattr(StubRelay, "log", lambda self, t, what: logs.append(what))
+    snap: dict = {}
+
+    def driver():
+        wait_for(lambda: any("person is in the scene" in m for m in logs))
+        t0 = time.monotonic()
+        freeze(ctl)
+        wait_for(lambda: has_state(stub_dream, "frozen"), timeout=2.0)
+        snap["delay"] = time.monotonic() - t0
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    assert snap["delay"] < 1.0  # not the 3 s pause
+
+
+def test_freeze_before_restart_does_no_restart_work(stub_dream, tmp_path, ctl, monkeypatch):
+    stub_dream.finish = False
+    stub_dream.loop_error = RuntimeError("stalled")
+
+    def log(self, t, what):
+        if "Dream loop stopped" in what:
+            freeze(ctl)  # the freeze lands just before the restart work
+    monkeypatch.setattr(StubRelay, "log", log)
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    assert stub_dream.calls.count("open_client") == 1 and stub_dream.ik_calls == 1  # the initial ones only
+    assert has_state(stub_dream, "frozen") and stub_dream.states[-1]["state"] == "done"
+
+
+def test_loop_fault_survives_a_freeze(stub_dream, tmp_path, ctl, monkeypatch):
+    stub_dream.finish = False
+    stub_dream.loop_error = RuntimeError("stalled")
+
+    def log(self, t, what):
+        if "restart 4" in what:
+            freeze(ctl)  # restart 4 is the one that gives up and records the fault
+    monkeypatch.setattr(StubRelay, "log", log)
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        end()
+    t, errors = in_thread(driver)
+    with pytest.raises(RuntimeError, match="stalled"):
+        run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    final = json.loads((tmp_path / "state.json").read_text())
+    assert final["state"] == "error" and "stalled" in final["error"]
+    assert has_state(stub_dream, "frozen")
+
+
+def test_freeze_as_end_home_finishes_is_not_lost(stub_dream, tmp_path, ctl, fast_poll):
+    stub_dream.finish = False
+    stub_dream.on_home_done = lambda n: freeze(ctl) if n == 2 else None  # call 2: the post-loop end move
+    snap: dict = {}
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        end()
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        time.sleep(0.2)
+        snap["order"] = list(stub_dream.order)
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    assert "state:parking" not in snap["order"] and "torque_off" not in snap["order"]
