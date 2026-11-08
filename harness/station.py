@@ -44,6 +44,14 @@ class StationHandle:
         self._control = None
         self.ready = threading.Event()
         self.fault: BaseException | None = None
+        self.augmenter = None  # the AugmentingClient when the station runs with --augment
+
+    def camera_names(self) -> list[str]:
+        return [] if self._control is None else sorted(self._control.video)
+
+    def camera_rgb(self, name: str) -> np.ndarray | None:
+        frame = None if self._control is None else self._control.video.get(name)
+        return None if frame is None else frame.data
 
     def set_task(self, text: str) -> None:
         if self._aloop is None or self._control is None:
@@ -66,8 +74,11 @@ class StationHandle:
 
 async def run_station(handle: StationHandle, checkpoint: str, *, dry_run: bool, stop: asyncio.Event,
                       station_config: pathlib.Path = STATION_CONFIG,
-                      on_ready: Callable[[], Awaitable[None]] | None = None) -> None:
-    """Opens the station, runs the loop on `HOLD_STILL` until `stop`, then homes and switches the arms off."""
+                      on_ready: Callable[[], Awaitable[None]] | None = None,
+                      augment: tuple | None = None) -> None:
+    """Opens the station, runs the loop on `HOLD_STILL` until `stop`, then homes and switches the arms off.
+
+    `augment` is `(calibration, spec, detector)` to mark the target ball in what Dream sees (harness/augment.py)."""
     from robots import bodies, control, followers, home
     from robots import config as rconfig
     from robots import run as rrun
@@ -82,6 +93,12 @@ async def run_station(handle: StationHandle, checkpoint: str, *, dry_run: bool, 
         readers = await asyncio.to_thread(rrun.make_cameras, app)
         kin = rrun.make_kinematics(app)
         client = await asyncio.to_thread(rrun.open_client, dream_config)
+        if augment is not None:
+            from harness import augment as aug
+            cal, spec, detector = augment
+            client = aug.wrap(client, cal, spec, detector=detector)
+            if isinstance(client, aug.AugmentingClient):
+                handle.augmenter = client
         warmup = getattr(rrun, "TRAJ_WARMUP_S", None)  # only some dreamlabs versions compile the IK up front
         if warmup is not None and hasattr(client, "wait_for_ik"):
             if not await asyncio.to_thread(client.wait_for_ik, warmup):

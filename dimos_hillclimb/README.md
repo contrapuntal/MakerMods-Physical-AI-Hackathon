@@ -111,6 +111,14 @@ repos/dimos/.venv/bin/python -m harness.test_station_server --port 8765     # se
   portal-makermods venv, and `harness serve --help` runs there. Not yet run on the station itself: start with
   `--dry-run`.
 
+## Sim tower (Nov 8)
+
+The sim now builds the station's tower: three cubes, then a rod in the top cube (`stack_cube(cube, "tower_spot")`,
+`stack_cube(cube, <cube below>)` twice, `insert_rod(rod, <top cube>)`, `check_tower()`), with the measured piece
+sizes. `stack_cube(cube, "rod:...")` is refused on both backends now. Through `SimStation` with that sequence, seeds 1
+to 8 passed stack in 7 of 8 relays (tower 6.57 in); the scripted demo alone builds it on 19 of 20 seeds. The results
+below predate this change.
+
 ## Verified (Nov 7, sim backend)
 
 - `drive` over MCP, seeds 1 to 10: 8 of 10 passed unplug and stack. Seeds 1, 3, 4, 5 and 6 scored the full 40.

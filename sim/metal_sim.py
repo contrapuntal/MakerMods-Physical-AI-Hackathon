@@ -124,7 +124,8 @@ class MetalSim:
         if task == "relay":
             self._layout_balls(taken)
         for name in ("cube_blue", "cube_green", "cube_purple", "rod_red", "rod_green", "rod_yellow"):
-            xy = self._free_spot(taken, x_rng, y_rng)
+            # Rods stand 4 in tall and tip when the arm brushes them: give them more room than the cubes.
+            xy = self._free_spot(taken, x_rng, y_rng, clearance=0.095 if name.startswith("rod") else 0.075)
             yaw = r.uniform(-np.pi, np.pi)
             if name.startswith("cube"):
                 self._set_free(name, [xy[0], xy[1], CUBE_HALF_Z], _quat_z(yaw))
@@ -151,14 +152,18 @@ class MetalSim:
         self._spawn_side = "right"
 
     def _free_spot(self, taken, x_rng, y_rng, clearance: float = 0.075) -> npt.NDArray[np.float64]:
-        for _ in range(500):
-            xy = np.array([self.rng.uniform(*x_rng), self.rng.uniform(*y_rng)])
-            bases = [self.base_xy[self._spawn_side]] if self._spawn_side else list(self.base_xy.values())
-            reach = min(float(np.linalg.norm(xy - b)) for b in bases)
-            clear_of_arms = min(float(np.linalg.norm(xy - b)) for b in self.base_xy.values()) > 0.21
-            if clear_of_arms and reach < 0.37 and all(np.linalg.norm(xy - t) > clearance for t in taken):
-                taken.append(xy)
-                return xy
+        """A random spot in range, reachable, clear of the arms and `clearance` from every taken spot; on a crowded
+        table the clearance is relaxed step by step (never below 6 cm) rather than giving up."""
+        for c in (clearance, clearance * 0.9, clearance * 0.8, 0.06):
+            c = max(c, 0.06)
+            for _ in range(500):
+                xy = np.array([self.rng.uniform(*x_rng), self.rng.uniform(*y_rng)])
+                bases = [self.base_xy[self._spawn_side]] if self._spawn_side else list(self.base_xy.values())
+                reach = min(float(np.linalg.norm(xy - b)) for b in bases)
+                clear_of_arms = min(float(np.linalg.norm(xy - b)) for b in self.base_xy.values()) > 0.21
+                if clear_of_arms and reach < 0.37 and all(np.linalg.norm(xy - t) > c for t in taken):
+                    taken.append(xy)
+                    return xy
         raise RuntimeError("no free spot for a prop")
 
     def _set_free(self, body: str, pos, quat) -> None:

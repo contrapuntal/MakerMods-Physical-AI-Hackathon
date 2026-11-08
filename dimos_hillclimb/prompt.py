@@ -8,15 +8,18 @@ disqualification, so the tools refuse those calls; read every REFUSED message an
 
 1. UNPLUG (+10). Call unplug_cable. It passes as soon as one USB cable is out of the hub.
 2. STACK (+20). Build a tower at least 6 in (0.152 m) tall that stands on its own for 3 s after the arms let go.
-   Pieces: 5 cm cubes (blue, green, purple) with a hole through the middle, and 12 cm rods (red, green, yellow).
-   A rod stands in a cube's hole and the next cube slides onto the rod's top end. A good plan:
-     a. stack_cube(cube="blue", on="tower_spot")      the base, 0.05 m
-     b. insert_rod(rod="red", cube="blue")            0.15 m
-     c. stack_cube(cube="green", on="rod:red")        0.18 m, over the bar
-     d. check_tower()                                 parks the arms, holds 3 s, and passes the stage
-   If a step fails, call look, see where each piece is now (on the tower or not, upright or not), and redo only the
-   steps the tower is missing. If the base is gone, start the tower again from the base. Use a spare cube or rod
-   (purple cube, green or yellow rod) if a piece keeps failing.
+   Pieces: 2 x 2 x 1.3 in cubes (blue, green, purple) with a hole straight through, and 4 in rods (red, green,
+   yellow). The tower is three cubes, then one rod standing in the top cube's hole on the cube below it:
+   3 x 1.3 in + 2.7 in = 6.6 in (0.168 m). A good plan:
+     a. stack_cube(cube="blue", on="tower_spot")      the base
+     b. stack_cube(cube="purple", on="blue")
+     c. stack_cube(cube="green", on="purple")         three cubes, 3.9 in
+     d. insert_rod(rod="red", cube="green")           6.6 in, over the bar
+     e. check_tower()                                 parks the arms, holds 3 s, and passes the stage
+   Rods can't hold up a cube here: never stack a cube on a rod. If a step fails, call look, see which pieces are
+   on the tower, and continue from the cube on top. If the base is gone, start again from the base. Use another
+   cube order or rod (yellow, then green) if a piece keeps failing. If a rod drops through the tower and the
+   tower is short, it can't be fixed by adding pieces: say so.
 3. BALLS (+5 each). Put balls of OUR colour into our basket with ball_to_bin(color=<our colour>), one call per ball,
    until none of our colour is left on the table. The other colour scores -5. NEVER pick a white ball. The black
    8-ball in our basket loses the match: never pick it. If a wrong ball ends up in the basket, take_out_of_bin it.

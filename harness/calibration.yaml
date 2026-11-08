@@ -34,11 +34,16 @@ colors:
   white:       {h_lo: 95,  h_hi: 120, s_lo: 28,  s_hi: 80,  v_lo: 140, v_hi: 235}
   black:       {h_lo: 0,   h_hi: 179, s_lo: 0,   s_hi: 255, v_lo: 0,   v_hi: 45}
   cable:       {h_lo: 0,   h_hi: 14,  s_lo: 60,  s_hi: 210, v_lo: 80,  v_hi: 255}
+  # Balls of the later tasks (Balls_In_Basket, Nov 7): blue ball H97-100 S205-241 V112-123 (the blue cube is the same
+  # hue but darker, V67-77); lime-yellow ball H36-49 S56-80 V174-196 (brighter than the green cube and rod, V144).
+  blue_ball:   {h_lo: 93,  h_hi: 104, s_lo: 120, s_hi: 255, v_lo: 95,  v_hi: 200}
+  yellow_ball: {h_lo: 33,  h_hi: 50,  s_lo: 40,  s_hi: 185, v_lo: 160, v_hi: 255}
 
 cube_colors: [blue, green, purple]
 rod_colors: [red, green, yellow]
 ball_colors: [orange, green_ball]   # the two coin-flip colours; the harness says "green", not "green_ball"
 avoid_balls: [white]                # never picked, kept clear of, taken out of the bin if one lands there
+other_balls: [blue_ball, yellow_ball]  # other tasks' balls: the detectors name them, the match ignores them
 cable_colors: [cable]               # counted inside hub_roi only
 eight_ball: black
 

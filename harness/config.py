@@ -49,6 +49,8 @@ class Calibration:
     ball_colors: list[str] = dataclasses.field(default_factory=list)  # the two ping-pong colours (coin-flip choices)
     cable_colors: list[str] = dataclasses.field(default_factory=list)
     avoid_balls: list[str] = dataclasses.field(default_factory=list)  # never picked (the white balls)
+    # Ball colours seen on the table outside this match's rules (other tasks' balls): known to the detectors only.
+    other_balls: list[str] = dataclasses.field(default_factory=list)
     eight_ball: str = "black"
     # Blob sizes in pixels at the frame size above.
     cube_area: tuple[int, int] = (250, 4000)
@@ -80,7 +82,7 @@ class Calibration:
             elif isinstance(getattr(cal, key), tuple):
                 value = tuple(value)
             setattr(cal, key, value)
-        for group in ("cube_colors", "rod_colors", "ball_colors", "cable_colors", "avoid_balls"):
+        for group in ("cube_colors", "rod_colors", "ball_colors", "cable_colors", "avoid_balls", "other_balls"):
             for c in getattr(cal, group):
                 if c not in cal.colors:
                     raise ValueError(f"calibration: {group} names {c!r}, which has no HSV range under colors")
@@ -111,6 +113,27 @@ class MatchConfig:
     rod_first: bool = True
     # A fine-tune learns the exact task text of its demos: when set, the unplug step sends just this, every try.
     trained_unplug: str | None = None
+    # Per stage ("unplug", "stack", "balls"): the Dream model to run it with (missing: the run's --checkpoint), and
+    # the task text its demos were recorded with. A stage with a text is run as one instruction, word for word,
+    # instead of the step-by-step base-model plan (stack: the whole tower in one go; balls: every pick).
+    stage_models: dict[str, str] = dataclasses.field(default_factory=dict)
+    stage_texts: dict[str, str] = dataclasses.field(default_factory=dict)
+    # Per stage, Metal gravity compensation x this while that stage's model runs (harness/gravity.py); a stage not
+    # named keeps the run's --gravity-scale.
+    stage_gravity: dict[str, float] = dataclasses.field(default_factory=dict)
+    # Stack pass bar for a whole-tower fine-tune, checked by Claude: "6in" (the rubric as we read it) or "3-cubes"
+    # (three cubes stacked, standing on their own: what the team's demos build, 3.9 in).
+    # Seconds of match time the cable model keeps pulling after the first cable is out (the same sentence, so Dream
+    # carries on): its demos pull every cable. 0 = move on at the first cable.
+    pull_cables_until_s: float = 0.0
+    # Practice: start the relay at this stage ("unplug", "stack" or "balls"); the earlier stages are skipped, not
+    # scored. A real match always starts at "unplug".
+    start_stage: str = "unplug"
+    stack_pass: str = "6in"
+    # True: every ball colour but white and black scores (what the team's ball demos do): any coloured ball in the
+    # bin counts, none is taken back out, and a ball next to a white one is still a target (the model pushes whites).
+    all_colors: bool = False
+    stack_all_timeout_s: float = 90.0  # one whole-tower instruction, before it is sent again (same words: no reset)
     hold_s: float = 3.0  # the rubric's free-standing check after the gripper lets go
     clear_of_later_cm: float = 8.0  # never instruct a target this close to a later stage's object
     clear_of_eight_cm: float = 6.0  # never pick a ball this close to the black 8-ball

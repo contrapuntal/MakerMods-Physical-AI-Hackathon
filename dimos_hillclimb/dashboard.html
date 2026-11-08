@@ -107,7 +107,29 @@
   .tag.running { background: var(--run-bg); color: var(--run); }
   .logwrap { max-height: 420px; overflow: auto; }
   .empty { color: var(--muted); padding: 18px 8px; text-align: center; }
+  /* What Dream sees */
+  .camctl { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 12px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; min-height: 34px; padding: 6px 12px; font-weight: 600; color: var(--muted); }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+  .chk { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; user-select: none; }
+  .chk input { min-height: 0; width: 16px; height: 16px; accent-color: var(--accent); }
+  .camgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+  .cam { min-width: 0; }
+  .cam .head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 13px; }
+  .cam .head b { font-weight: 650; }
+  .cam .pair { display: grid; gap: 6px; }
+  .cam .pair.two { grid-template-columns: 1fr 1fr; }
+  .cam .frame .lbl { position: absolute; left: 8px; top: 8px; font: 600 10px var(--mono); color: #fff;
+                     background: rgba(0,0,0,.55); padding: 3px 6px; border-radius: 4px; letter-spacing: .05em; text-transform: uppercase; }
+  .badge { font: 600 11px var(--mono); padding: 3px 7px; border-radius: 999px; background: var(--track); color: var(--muted); }
+  .badge.hit { background: #fbe3fb; color: #9b1c9b; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .badge.hit { background: #3b1838; color: #ff8cf5; } }
+  :root[data-theme="dark"] .badge.hit { background: #3b1838; color: #ff8cf5; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 10px; }
   @media (max-width: 600px) {
+    .cam .pair.two { grid-template-columns: 1fr; }
     .big { gap: 16px; } .stat .value { font-size: 24px; }
     td.d, th.d { display: none; }
   }
@@ -180,6 +202,31 @@
       </section>
     </div>
   </div>
+
+  <section class="card" style="margin-top:16px" id="dreamview">
+    <h2>What Dream sees <span class="muted" id="yolostate" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+    <div class="camctl">
+      <div class="seg" role="group" aria-label="View">
+        <button data-view="raw">Raw</button>
+        <button data-view="aug" aria-pressed="true">YOLO on</button>
+        <button data-view="both">Side by side</button>
+        <button data-view="sent" id="sentbtn" hidden>Sent to Dream</button>
+      </div>
+      <label class="chk"><input type="checkbox" data-mode="box" checked> Ring the ball</label>
+      <label class="chk"><input type="checkbox" data-mode="suppress" checked> Grey out decoys</label>
+      <label class="chk"><input type="checkbox" data-mode="spotlight"> Spotlight</label>
+      <label class="chk"><input type="checkbox" id="yoloboxes" checked> YOLO ball boxes</label>
+      <select id="camtarget" aria-label="Ball to find"></select>
+      <select id="camdet" aria-label="Detector">
+        <option value="both">YOLO + colour</option>
+        <option value="yolo">YOLO only</option>
+        <option value="hsv">Colour only</option>
+      </select>
+    </div>
+    <div class="toast" id="camerr" hidden style="color:var(--bad);margin:0 0 10px"></div>
+    <div class="camgrid" id="camgrid"><div class="empty">Looking for cameras…</div></div>
+    <div class="note" id="camnote">A preview of harness/augment.py on the live cameras. Dream only gets these frames when the station runs with <code>--augment</code>; “Sent to Dream” then shows the exact frames it was given.</div>
+  </section>
 
   <section class="card" style="margin-top:16px">
     <h2>Skill calls <span class="muted" id="callcount" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
@@ -295,6 +342,83 @@ async function nextFrame() {
   } finally { clearTimeout(timer); }
 }
 setInterval(() => { $("frameage").textContent = frameAt ? `${((Date.now() - frameAt) / 1000).toFixed(1)} s ago` : "–"; }, 250);
+
+// ---------------------------------------------------------------- What Dream sees
+const CAMLABEL = { overhead: "Overhead", scene: "Overhead", wrist_l: "Left wrist", wrist_r: "Right wrist",
+                   left_wrist: "Left wrist", right_wrist: "Right wrist", wrist_left: "Left wrist", wrist_right: "Right wrist" };
+const cam = { names: [], sent: [], view: "aug", gen: 0 };
+try { cam.view = localStorage.getItem("hc.camview") || "aug"; } catch (e) {}
+
+function camModes() { return [...document.querySelectorAll("[data-mode]")].filter(x => x.checked).map(x => x.dataset.mode).join(","); }
+function camTiles() {
+  // one tile per camera; per tile, the frames to show: [{label, url()}]
+  if (cam.view === "sent") return cam.sent.map(k => ({ id: k, title: k, frames: [{ label: "sent", url: () => `/api/sent/${k}.jpg` }] }));
+  const q = () => `target=${encodeURIComponent($("camtarget").value)}&detector=${$("camdet").value}`;
+  const raw = (n) => ({ label: "raw", url: () => `/api/cam/${n}.jpg?modes=off` });
+  const aug = (n) => ({ label: "yolo on", url: () => `/api/cam/${n}.jpg?modes=${camModes() || "off"}&boxes=${$("yoloboxes").checked ? 1 : 0}&${q()}`, info: true });
+  return cam.names.map(n => ({ id: n, title: CAMLABEL[n] || n,
+    frames: cam.view === "raw" ? [raw(n)] : cam.view === "aug" ? [aug(n)] : [raw(n), aug(n)] }));
+}
+function buildCams() {
+  cam.gen++;
+  document.querySelectorAll(".seg [data-view]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.view === cam.view)));
+  const tiles = camTiles();
+  if (!tiles.length) { $("camgrid").innerHTML = `<div class="empty">${cam.view === "sent" ? "Nothing sent yet: is the station running with --augment, on a ball step?" : "No cameras reported yet."}</div>`; return; }
+  $("camgrid").innerHTML = tiles.map((t, i) => `<div class="cam"><div class="head"><b>${esc(t.title)}</b><span class="spacer"></span><span class="badge" id="cb${i}">–</span></div>`
+    + `<div class="pair ${t.frames.length > 1 ? "two" : ""}">` + t.frames.map((f, j) => `<div class="frame"><img id="ci${i}_${j}" alt="${esc(t.title)} ${f.label}"><span class="lbl">${f.label}</span></div>`).join("")
+    + `</div></div>`).join("");
+  const gen = cam.gen;
+  tiles.forEach((t, i) => t.frames.forEach((f, j) => camLoop(gen, i, j, f)));
+}
+async function camLoop(gen, i, j, f) {
+  let prev = null;
+  while (gen === cam.gen) {
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 12000);
+    try {
+      const r = await fetch(f.url() + (f.url().includes("?") ? "&" : "?") + "t=" + Date.now(), { cache: "no-store", signal: ctl.signal });
+      if (r.ok && gen === cam.gen) {
+        const url = URL.createObjectURL(await r.blob()), img = $(`ci${i}_${j}`);
+        if (img) img.src = url;
+        if (prev) URL.revokeObjectURL(prev);
+        prev = url;
+        const b = $(`cb${i}`);
+        if (b && (f.info || cam.view === "raw" || cam.view === "sent")) {
+          const n = +(r.headers.get("X-Found") || 0), ms = r.headers.get("X-Ms"), src = r.headers.get("X-Sources");
+          const yb = r.headers.get("X-Yolo-Balls"), yc = r.headers.get("X-Yolo-Colors");
+          const yolo = yb ? ` · yolo ${yb === "0" ? "0 balls" : yc.split(",").join(", ")}` : "";
+          if (f.info) { b.textContent = (n ? `${n} target · ${src}` : "no target") + `${yolo} · ${ms} ms`; b.className = "badge" + (n ? " hit" : ""); }
+          else { b.textContent = cam.view; b.className = "badge"; }
+        }
+      }
+    } catch (e) { /* the server is busy or restarting: try again */ }
+    clearTimeout(timer);
+    await new Promise(res => setTimeout(res, 300));
+  }
+}
+async function loadCams() {
+  try {
+    const r = await fetch("/api/cameras", { cache: "no-store" });
+    const c = await r.json();
+    const changed = JSON.stringify([c.cameras, c.sent]) !== JSON.stringify([cam.names, cam.sent]);
+    cam.names = c.cameras || []; cam.sent = c.sent || [];
+    $("sentbtn").hidden = !cam.sent.length;
+    if (!cam.sent.length && cam.view === "sent") cam.view = "aug";
+    $("yolostate").textContent = `· ${c.source || "cameras"} · ` + (c.yolo ? "YOLO ready" : `YOLO not available${c.yolo_error ? " (" + c.yolo_error + ")" : ""}: colour only`);
+    $("camerr").textContent = c.source_error || ""; $("camerr").hidden = !c.source_error;
+    if (!$("camtarget").options.length) {
+      const colors = ["green", "orange"];
+      $("camtarget").innerHTML = colors.map(x => `<option value="${x}">${x} ball</option>`).join("");
+      $("camtarget").value = colors.includes(c.own_color) ? c.own_color : "green";
+    }
+    if (changed) buildCams();
+  } catch (e) {}
+  setTimeout(loadCams, 5000);
+}
+document.querySelectorAll(".seg [data-view]").forEach(b => b.onclick = () => {
+  cam.view = b.dataset.view; try { localStorage.setItem("hc.camview", cam.view); } catch (e) {}
+  buildCams();
+});
+loadCams();
 
 $("start").onclick = () => post("/api/start", { own_color: $("color").value, seed: $("seed").value });
 $("park").onclick = () => post("/api/park");

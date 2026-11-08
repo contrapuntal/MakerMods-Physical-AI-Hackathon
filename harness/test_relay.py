@@ -227,3 +227,140 @@ def test_trained_unplug_text_is_sent_verbatim_on_every_try():
             if step and step.kind == "unplug":
                 texts.add(step.instruction)
     assert texts == {"Remove Orange Cables from their port"}
+
+
+def test_plan_stages_per_stage_models_and_texts():
+    from harness.__main__ import plan_stages
+    base = "dreamlabs/dream-1-beta"
+    models, texts = plan_stages(base, {"unplug": "dream-1-ft:aa-cables", "stack": None, "balls": "dream-1-ft:bb-balls"},
+                                {"unplug": None, "stack": None, "balls": None})
+    assert models == {"unplug": "dream-1-ft:aa-cables", "stack": base, "balls": "dream-1-ft:bb-balls"}
+    assert set(texts) == {"unplug", "balls"}  # the base-model stack keeps its step-by-step plan
+    # One all-in-one fine-tune: every stage on it, each with its recorded text; "" turns one off.
+    models, texts = plan_stages("dream-1-ft:cc-all", {}, {"stack": ""})
+    assert set(models.values()) == {"dream-1-ft:cc-all"} and set(texts) == {"unplug", "balls"}
+
+
+def test_stack_all_passes_only_with_claude_and_then_moves_to_balls():
+    c = cal()
+    m = MatchConfig(own_color="orange", calibration=c, stage_texts={"stack": "Stack the green, purple, and blue blocks"})
+    r = Relay(m)
+    w = world([o("cube", "blue", 250, 250), o("cube", "green", 300, 250), o("ball", "orange", 100, 300)], c)
+    r.start(w, 0.0)
+    r.stage_index = 1  # unplug already passed
+    step = r.next_step(w, 0.0)
+    assert step.kind == "stack_all" and step.instruction == "Stack the green, purple, and blue blocks"
+    t = 0.0
+    for _ in range(60):  # without Claude: never claims the stage
+        t += 0.5
+        assert r.observe(w, t, OPEN) is Outcome.RUNNING
+    r.confirm_kinds = {"stack_all"}
+    for _ in range(4):
+        t += 0.5
+        r.observe(w, t, OPEN)
+    assert r.pending_confirm == "stack_all"
+    r.resolve_confirm(True, "tall tower", t)
+    t += 0.5
+    assert r.observe(w, t, OPEN) is Outcome.PASSED and r.stage == "balls"
+
+
+def test_default_run_uses_the_team_fine_tunes_with_their_own_sentences():
+    from harness.__main__ import DEFAULT_STAGE_MODELS, MODEL_TEXTS, plan_stages
+    models, texts = plan_stages(None, {}, {})
+    assert models == DEFAULT_STAGE_MODELS
+    assert texts == {st: MODEL_TEXTS[models[st]] for st in models}
+    # Swapping the balls model swaps its sentence too.
+    models, texts = plan_stages(None, {"balls": "dream-1-ft:39478655-nuck3-balls-basket"}, {})
+    assert texts["balls"] == "Place yellow, blue, green, and orange balls into basket."
+    # Base Dream-1 everywhere: the step-by-step plan, no trained sentences.
+    models, texts = plan_stages("dreamlabs/dream-1-beta", {}, {})
+    assert set(models.values()) == {"dreamlabs/dream-1-beta"} and texts == {}
+
+
+def test_put_down_runs_on_the_cable_model_with_its_own_sentence():
+    c = cal()
+    m = MatchConfig(own_color="orange", calibration=c,
+                    stage_texts={"unplug": "Remove Orange Cables from their port", "stack": "Stack the blocks"})
+    r = Relay(m)
+    w = world([o("plug", "orange", 50, 50), o("cube", "blue", 250, 250)], c)
+    r.start(w, 0.0)
+    step = r.next_step(w, 0.0)
+    r._last_grip = {"left": 1.0, "right": 0.1}  # the cable still in the right gripper
+    r._on_pass(step, w, 1.0)
+    assert r.stage == "stack" and r.holding
+    put = r.next_step(w, 1.0)
+    assert put.kind == "put_down" and put.stage == "unplug"  # the executor keeps the cable model for it
+    assert put.instruction == "Remove Orange Cables from their port"
+    assert r.observe(w, 2.0, OPEN) is Outcome.RUNNING
+    assert r.observe(w, 2.5, OPEN) is Outcome.PASSED  # gripper open twice: put down
+    nxt = r.next_step(w, 3.0)
+    assert nxt.stage == "stack" and nxt.instruction == "Stack the blocks" and r.holding_stage is None
+
+
+def test_all_colors_counts_every_ball_and_takes_none_back_out():
+    c = cal()
+    m = MatchConfig(own_color="orange", calibration=c, all_colors=True,
+                    stage_texts={"balls": "Place all balls in the basket. Push away all white balls."})
+    r = Relay(m)
+    other = next(col for col in c.ball_colors if col != "orange")
+    # an other-colour ball already in the bin, an own ball on the table next to a white one
+    w = world([o("ball", other, 550, 50), o("ball", "orange", 100, 300), o("avoid_ball", "white", 108, 300)], c)
+    r.start(w, 0.0)
+    r.stage_index = 2
+    step = r.next_step(w, 0.0)
+    assert step.kind == "ball"  # not "take_out", and the white neighbour doesn't block it
+    w2 = world([o("ball", other, 550, 50), o("ball", "orange", 560, 60), o("avoid_ball", "white", 108, 300)], c)
+    t = 0.5
+    assert r.observe(w, t, {"left": 0.1, "right": 1.0}) is Outcome.RUNNING  # grabbed
+    for _ in range(4):
+        t += 0.5
+        out = r.observe(w2, t, OPEN)  # let go over the bin
+        if out is not Outcome.RUNNING:
+            break
+    assert out is Outcome.PASSED and r.own_in_bin == 2 and r.other_in_bin == 0
+
+
+def test_keeps_pulling_cables_until_the_time_set():
+    c = cal()
+    m = MatchConfig(own_color="orange", calibration=c, pull_cables_until_s=60.0,
+                    stage_texts={"unplug": "Remove Orange Cables from their port", "stack": "Stack the blocks"})
+    r = Relay(m)
+    w = world([o("plug", "orange", 50, 50), o("cube", "blue", 250, 250)], c)
+    r.start(w, 0.0)
+    first = r.next_step(w, 0.0)
+    r._last_grip = dict(OPEN)
+    r._on_pass(first, w, 20.0)  # Claude saw the first cable out at 20 s
+    assert r.stage == "unplug"
+    more = r.next_step(w, 20.0)
+    assert more.kind == "unplug_more" and more.instruction == first.instruction  # same words: Dream carries on
+    t = 20.0
+    while True:
+        t += 0.5
+        out = r.observe(w, t, OPEN)
+        if out is not Outcome.RUNNING:
+            break
+    assert out is Outcome.PASSED and r.stage == "stack" and 59.0 <= t <= 61.0
+    assert r.next_step(w, t).instruction == "Stack the blocks"
+
+
+def test_trained_ball_model_only_ever_gets_its_own_sentence():
+    c = cal()
+    text = "Place yellow, blue, green, and orange balls into basket."
+    r = Relay(MatchConfig(own_color="orange", calibration=c, all_colors=True, stage_texts={"balls": text}))
+    other = next(col for col in c.ball_colors if col != "orange")
+    empty = world([], c)  # no ball seen: the old code parked with new words
+    in_bin = world([o("ball", other, 550, 50), o("avoid_ball", "white", 560, 60)], c)  # the old code took them out
+    r.start(empty, 0.0)
+    r.stage_index = 2
+    for w in (empty, in_bin):
+        assert r.next_step(w, 1.0).instruction == text
+
+
+def test_practice_can_start_at_the_stack_stage():
+    c = cal()
+    r = Relay(MatchConfig(own_color="orange", calibration=c, start_stage="stack",
+                          stage_texts={"stack": "Stack the green, purple, and blue blocks"}))
+    w = world([o("plug", "orange", 50, 50), o("cube", "blue", 250, 250)], c)
+    r.start(w, 0.0)
+    step = r.next_step(w, 0.0)
+    assert r.stage == "stack" and step.kind == "stack_all" and "unplug" not in r.passed

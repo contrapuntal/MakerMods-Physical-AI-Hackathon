@@ -84,29 +84,33 @@ def drive(url: str, own_color: str = "", seed: int = -1, station: bool = False) 
     print("stage 2: stack")
     if station:
         stack_station(d)
-    # base cube -> rod in it -> cube on the rod; a piece that failed twice goes to the back of the line
+    # The station's tower: three cubes, then a rod standing in the top one. A piece that failed twice goes to the
+    # back of the line; one that failed 6 times is dropped.
     fails: dict[str, int] = {}
 
     def pick(options: list[str]) -> str | None:
         usable = [o for o in options if fails.get(o, 0) < 2 * TRIES]
         return min(usable, key=lambda o: fails.get(o, 0) >= 2, default=None)
 
-    for _ in range(0 if station else TRIES * 4):
+    for _ in range(0 if station else TRIES * 5):
         s = d.scene()
-        on_tower = [p.split()[1] for p in s["tower"]["pieces"]]  # "cube blue" -> "blue"
-        pieces = s["tower"]["pieces"]
+        pieces = s["tower"]["pieces"]  # "cube blue", base first
+        cubes_on = [p.split()[1] for p in pieces if p.startswith("cube")]
         if s["tower"]["height_m"] >= s["tower"].get("pass_height_m", 0.152):
             if d.ok(d.call("check_tower")):
                 break
             continue
-        free_cubes = [c for c in ("blue", "green", "purple") if not s["cubes"][c]["on_tower"]]
+        free_cubes = [c for c in ("blue", "purple", "green") if not s["cubes"][c]["on_tower"]]
+        if pieces and not pieces[-1].startswith("cube"):
+            print("  a rod is on top but the tower is short (it dropped through?); can't add to it")
+            break
         if not pieces:
             piece, call = pick(free_cubes), lambda p: d.call("stack_cube", cube=p, on="tower_spot")
-        elif pieces[-1].startswith("cube"):
-            rods = [r for r in ("red", "yellow", "green") if not s["rods"][r]["on_tower"] and s["rods"][r]["upright"]]
-            piece, call = pick(rods), lambda p: d.call("insert_rod", rod=p, cube=on_tower[-1])
+        elif len(cubes_on) < 3 and free_cubes:
+            piece, call = pick(free_cubes), lambda p: d.call("stack_cube", cube=p, on=cubes_on[-1])
         else:
-            piece, call = pick(free_cubes), lambda p: d.call("stack_cube", cube=p, on=f"rod:{on_tower[-1]}")
+            rods = [r for r in ("red", "yellow", "green") if not s["rods"][r]["on_tower"] and s["rods"][r]["upright"]]
+            piece, call = pick(rods), lambda p: d.call("insert_rod", rod=p, cube=cubes_on[-1])
         if piece is None:
             print("  out of usable pieces")
             break

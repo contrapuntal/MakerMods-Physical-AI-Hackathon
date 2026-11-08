@@ -30,6 +30,7 @@ does keep the relay's safety margins (a ball next to the black or a white ball i
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import json
 import logging
@@ -327,6 +328,23 @@ def make_http(server: StationServer, host: str, port: int) -> ThreadingHTTPServe
                 if self.path == "/world":
                     seen = server.world()
                     return self._json(200, server.describe(seen[0])) if seen else self._json(503, {"error": "no frame"})
+                if self.path == "/cameras":
+                    aug = getattr(server.station, "augmenter", None)
+                    return self._json(200, {"cameras": getattr(server.station, "camera_names", list)(),
+                                            "sent": sorted(aug.last_sent) if aug else [],
+                                            "augment": ",".join(aug.modes) if aug else None})
+                if self.path.startswith("/camera/"):
+                    rgb = getattr(server.station, "camera_rgb", lambda n: None)(self.path[len("/camera/"):])
+                    if rgb is None:
+                        return self._json(404, {"error": "no such camera, or no frame yet"})
+                    ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+                    return self._send(200, jpg.tobytes(), "image/jpeg")
+                if self.path.startswith("/sent/"):
+                    aug = getattr(server.station, "augmenter", None)
+                    sent = aug.last_sent.get(self.path[len("/sent/"):]) if aug else None
+                    if sent is None:
+                        return self._json(404, {"error": "nothing sent under that key (is --augment on?)"})
+                    return self._send(200, base64.b64decode(sent[1]), "image/jpeg")
                 if self.path == "/frame":
                     snap = server.station.snapshot()
                     if snap is None:

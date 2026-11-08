@@ -77,6 +77,24 @@ class DreamStation:
         jpg = np.frombuffer(self._get("/frame").content, np.uint8)
         return cv2.cvtColor(cv2.imdecode(jpg, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
 
+    def camera_info(self) -> dict:
+        return self._get("/cameras", timeout=3).json()
+
+    def camera_names(self) -> list[str]:
+        return self.camera_info()["cameras"]
+
+    def camera_rgb(self, name: str) -> np.ndarray | None:
+        import cv2
+        r = self.http.get(f"{self.url}/camera/{name}", timeout=3)
+        if not r.ok:
+            return None
+        return cv2.cvtColor(cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+
+    def sent_jpeg(self, key: str) -> bytes | None:
+        """The frame the station's --augment wrapper last sent Dream under `key` (video.<role>), as is."""
+        r = self.http.get(f"{self.url}/sent/{key}", timeout=3)
+        return r.content if r.ok else None
+
     # ------------------------------------------------------------------ stage 1
     def unplug_cable(self) -> Outcome:
         self.rules.require("unplug")

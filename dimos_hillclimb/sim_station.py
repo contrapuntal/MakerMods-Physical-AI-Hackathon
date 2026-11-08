@@ -13,6 +13,7 @@ from __future__ import annotations
 import pathlib
 import sys
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -21,16 +22,16 @@ SIM_DIR = pathlib.Path(__file__).resolve().parent.parent / "sim"
 if str(SIM_DIR) not in sys.path:
     sys.path.insert(0, str(SIM_DIR))
 
-from demos import TIP_CLEAR_Z, TOP_DOWN, Demo, DemoFailed, _rz  # noqa: E402
+from demos import TIP_CLEAR_Z, TOP_CUBE_OFFSET, TOP_DOWN, Demo, DemoFailed  # noqa: E402
 from metal_sim import (  # noqa: E402
-    BALL_NAMES, BALL_R, CUBE_HALF, FPS, HOLE_DEPTH, REST_Q, ROD_HALF_LEN, MetalSim, Pose,
+    BALL_NAMES, BALL_R, CUBE_HALF_Z, FPS, PASS_HEIGHT_M, REST_Q, ROD_HALF_LEN, MetalSim, Pose,
 )
 
+from metal_sim import CAMERAS as SIM_CAMERAS  # noqa: E402
 from dimos_hillclimb.rules import EIGHT_BALL, MatchRules, Outcome, Refused  # noqa: E402
 
 CUBES = ("blue", "green", "purple")
 RODS = ("red", "green", "yellow")
-PASS_HEIGHT_M = 0.152  # the rubric's 6 in bar
 HOLD_S = 3.0
 CLEAR_OF_EIGHT_M = 0.06
 CLEAR_OF_WHITE_M = 0.04
@@ -74,6 +75,8 @@ class SimStation:
         self.lock = threading.RLock()
         self.live_every = 6  # render an overhead frame every N ticks during motions (0: off)
         self.latest_rgb: np.ndarray | None = None
+        self.latest_cams: dict[str, np.ndarray] = {}  # role -> RGB, for the dashboard's camera section
+        self.cams_wanted_until = 0.0  # the wrist cameras render during motions only while someone is watching
         self._renderer: _RenderThread | None = None
         self.ticks = 0
         self.tower: list[str] = []  # bodies, base first, as the station believes it built them
@@ -83,6 +86,10 @@ class SimStation:
         self.ticks += 1
         if self.live_every and self.ticks % self.live_every == 0:
             self.latest_rgb = self._render_overhead()  # for the dashboard while a motion holds the lock
+            self.latest_cams["overhead"] = self.latest_rgb
+            if time.monotonic() < self.cams_wanted_until:
+                for role in ("wrist_l", "wrist_r"):
+                    self.latest_cams[role] = self._renderer.render(SIM_CAMERAS[role])
 
     def _render_overhead(self) -> np.ndarray:
         """Call with self.lock held: the render thread reads sim.data while this thread waits."""
@@ -130,34 +137,30 @@ class SimStation:
             self.latest_rgb = self._render_overhead()
             return self.latest_rgb
 
+    def camera_names(self) -> list[str]:
+        return list(SIM_CAMERAS)
+
+    def camera_rgb(self, role: str) -> np.ndarray | None:
+        """One camera's frame; while a motion holds the sim, the newest one rendered during it (or None)."""
+        self.cams_wanted_until = time.monotonic() + 3.0
+        if not self.lock.acquire(timeout=0.05):
+            return self.latest_cams.get(role)
+        try:
+            if self._renderer is None:
+                self._renderer = _RenderThread(self.sim)
+            self.latest_cams[role] = self._renderer.render(SIM_CAMERAS[role])
+            return self.latest_cams[role]
+        finally:
+            self.lock.release()
+
     # ------------------------------------------------------------------ tower measurement
     def _tower_bodies(self) -> list[str]:
         """Pieces standing stacked on the tower spot, bottom first (measured, not remembered)."""
-        sim = self.sim
-        spot = sim.tower_xy
-        pieces = []
-        for name in [f"cube_{c}" for c in CUBES] + [f"rod_{r}" for r in RODS]:
-            p = sim.body_pose(name)
-            if np.linalg.norm(p.p[:2] - spot) < 0.03 and abs(p.R[2, 2]) > 0.95:
-                pieces.append((p.p[2], name))
-        pieces.sort()
-        out, top = [], 0.0
-        for z, name in pieces:
-            half = CUBE_HALF if name.startswith("cube") else ROD_HALF_LEN
-            if z - half > top + 0.005:  # a gap: not resting on what's below
-                break
-            out.append(name)
-            top = z + half
-        return out
+        return self.sim.tower_pieces()
 
     def _tower_report(self) -> dict:
         bodies = self._tower_bodies()
-        if not bodies:
-            return {"pieces": [], "height_m": 0.0}
-        top = bodies[-1]
-        half = CUBE_HALF if top.startswith("cube") else ROD_HALF_LEN
-        h = float(self.sim.body_pose(top).p[2] + half)
-        return {"pieces": [b.replace("_", " ") for b in bodies], "height_m": round(h, 3),
+        return {"pieces": [b.replace("_", " ") for b in bodies], "height_m": round(self.sim.tower_height(), 3),
                 "pass_height_m": PASS_HEIGHT_M}
 
     # ------------------------------------------------------------------ motion helpers
@@ -221,57 +224,43 @@ class SimStation:
             rod_b, cube_b = f"rod_{rod}", f"cube_{cube}"
 
             def motion() -> None:
-                d, sim = self.demo, self.sim
-                d.pick("right", d.rod_grasps(rod_b), lift=0.07)
-                top = sim.body_pose(cube_b).p + [0, 0, CUBE_HALF]
-                cz = top[2] - HOLE_DEPTH + 0.003 + ROD_HALF_LEN
-                d.place("right", rod_b, [Pose(np.array([top[0], top[1], cz]), _rz(k * np.pi / 6)) for k in range(12)],
-                        approach=0.04)
-                d.rest("right")
-                d.tick(15)
+                self.demo.rod_in("right", rod_b, cube_b)
+                self.demo.rest("right")
+                self.demo.tick(15)
 
             failed = self._run(f"insert the {rod} rod", motion)
             if failed:
                 return failed
             rod_p, cube_p = self.sim.body_pose(rod_b), self.sim.body_pose(cube_b)
             seated = (np.linalg.norm(rod_p.p[:2] - cube_p.p[:2]) < 0.012 and abs(rod_p.R[2, 2]) > 0.95
-                      and rod_p.p[2] - ROD_HALF_LEN < cube_p.p[2] + CUBE_HALF)
+                      and rod_p.p[2] - ROD_HALF_LEN < cube_p.p[2] + CUBE_HALF_Z)
             if seated:
                 return Outcome(True, f"the {rod} rod stands in the {cube} cube's hole", tower=self._tower_report())
             return Outcome(False, f"the {rod} rod is not standing in the {cube} cube (check the scene)",
                            tower=self._tower_report())
 
     def stack_cube(self, cube: str, on: str) -> Outcome:
-        """`on`: "tower_spot" for the base, "rod:<colour>" for a rod standing in the tower, or a cube colour."""
+        """`on`: "tower_spot" for the base cube, or the colour of the cube to set it on (the tower's top cube)."""
         with self.lock:
             self.rules.require("stack")
             self._check_names(cube=cube)
+            if on.startswith("rod:"):
+                raise Refused("the tower is cubes on cubes with one rod standing in the top cube: use "
+                              "stack_cube(cube, <the cube on top>) and then insert_rod(rod, <top cube>)")
             cube_b = f"cube_{cube}"
-            sim = self.sim
-            yaws = [k * np.pi / 8 for k in range(8)]
-            if on == "tower_spot":
-                def goals() -> list[Pose]:
-                    return [Pose(np.array([*sim.tower_xy, CUBE_HALF + 0.002]), _rz(a)) for a in yaws]
-            elif on.startswith("rod:"):
-                rod_b = "rod_" + on.split(":", 1)[1]
-                self._check_names(rod=on.split(":", 1)[1])
-                def goals() -> list[Pose]:
-                    top = sim.body_pose(rod_b).p + [0, 0, ROD_HALF_LEN]
-                    cz = top[2] - HOLE_DEPTH + CUBE_HALF + 0.003
-                    return [Pose(np.array([top[0], top[1], cz]), _rz(a)) for a in yaws]
-            else:
+            below = None
+            if on != "tower_spot":
                 self._check_names(cube=on)
                 below = f"cube_{on}"
-                def goals() -> list[Pose]:
-                    p = sim.body_pose(below).p
-                    return [Pose(np.array([p[0], p[1], p[2] + 2 * CUBE_HALF + 0.002]), _rz(a)) for a in yaws]
+            # Each cube goes a few mm off the one below, alternating sides: with every hole lined up the rod would drop
+            # straight through the stack (see Demo.cube_on).
+            n_cubes = sum(b.startswith("cube") for b in self._tower_bodies())
+            offset = 0.0 if below is None else TOP_CUBE_OFFSET * (1 if n_cubes % 2 else -1)
 
             def motion() -> None:
-                d = self.demo
-                d.pick("right", d.cube_grasps(cube_b), lift=0.06)
-                d.place("right", cube_b, goals(), approach=0.04)
-                d.rest("right")
-                d.tick(15)
+                self.demo.cube_on("right", cube_b, below, offset=offset)
+                self.demo.rest("right")
+                self.demo.tick(15)
 
             failed = self._run(f"stack the {cube} cube", motion)
             if failed:

@@ -1,6 +1,6 @@
 """Records scripted sim demonstrations into a LeRobot v2.1 dataset, with the hackathon kit's own writer and layout.
 
-    repos/dimos/.venv/bin/python sim/record.py --task stack --episodes 20 --out ~/hackathon_data/sim-stack
+    repos/dimos/.venv/bin/python sim/record.py --task stack --episodes 20 --out ~/hackathon_data/sim-tower
     repos/dimos/.venv/bin/python sim/record.py --task usb   --episodes 20 --out ~/hackathon_data/sim-usb
 
 Only episodes whose success check passes are kept (a failed scripted attempt is discarded, as a fumbled real demo
@@ -27,8 +27,7 @@ from demos import Demo, DemoFailed  # noqa: E402
 from metal_sim import FPS, MetalSim  # noqa: E402
 
 TASK_TEXT = {
-    "stack": "stack the blue cube, the red rod and the green cube into a tower",
-    "stack5": "stack the cubes and rods into a tower",
+    "stack": "stack the blue, purple and green cubes into a tower and stand a rod in the top cube",
     "usb": "unplug the USB cable from the power strip and plug it back in",
 }
 
@@ -75,9 +74,8 @@ def main() -> None:
                 demo.usb()
                 ok = unplugged[0] and sim.usb_seated()
             else:
-                levels = 5 if args.task == "stack5" else 3
-                demo.stack(levels=levels)
-                ok = sim.tower_levels() >= levels
+                demo.stack()
+                ok = sim.tower_passes() and any(p.startswith("rod") for p in sim.tower_pieces())
         except DemoFailed as e:
             ok, reason = False, str(e)
         if ok:

@@ -25,6 +25,11 @@ _log = logging.getLogger(__name__)
 # The task text the team's unplug demos are recorded with (~/hackathon_data/USB_Cable_Task): a fine-tuned model
 # runs on exactly this sentence.
 TRAINED_UNPLUG = "Remove Orange Cables from their port"
+# The other stages' demo texts (~/hackathon_data/Stacking_Boxes, Balls_In_Basket): sent word for word to their
+# fine-tuned models, the stage run as one instruction.
+TRAINED_STACK = "Stack the green, purple, and blue blocks"
+TRAINED_BALLS = "Place yellow, blue, green, and orange balls into basket."
+STACK_ALL_MIN_S = 15.0  # a whole-tower instruction is checked by Claude only after this long
 
 UNPLUG_WORDINGS = (
     # The strip's USB ports face up, so each plug comes out by pulling straight up (the team's wording first).
@@ -51,7 +56,7 @@ class Outcome(enum.Enum):
 @dataclasses.dataclass
 class Step:
     stage: str
-    kind: str  # unplug | rod_in_cube | place_cube | hold | ball | take_out | park
+    kind: str  # unplug | rod_in_cube | place_cube | hold | stack_all | ball | take_out | park
     instruction: str
     target: str  # what the step is about, for logs
     timeout_s: float
@@ -86,6 +91,9 @@ class Relay:
         self._confirmed = False
         self.eight_ball_alert = False  # set when Claude sees the 8-ball in our bin
         self.holding: str | None = None  # what a gripper still holds after a passed step (the pulled cable)
+        self.holding_stage: str | None = None  # the stage whose step left it held: its model puts it down
+        self.stack_start_rgb = None  # the overhead frame when stacking began: Claude compares the tower with it
+        self.cables_done_s: float | None = None  # when the first cable came out, while the cable model pulls more
         self._last_grip: dict[str, float] = {}
         self._step_started_s = 0.0
         self._good_polls = 0
@@ -137,6 +145,9 @@ class Relay:
         self.initial_off_hub = len(world.plugs_off_hub())
         self.initial_cable_px = world.cable_px_in_hub
         self.log(t, f"go: {world.summary()}; {self.initial_plugs} plug blob(s) at the hub")
+        if self.m.start_stage != "unplug":
+            self.stage_index = self.m_stages.index(self.m.start_stage)
+            self.log(t, f"practice: starting at the {self.m.start_stage} stage (earlier stages skipped, not scored)")
 
     def _advance(self, t: float, why: str) -> None:
         stage = self.stage
@@ -154,10 +165,15 @@ class Relay:
         if self.holding:
             # A gripper still holds what the last step moved (the cable it pulled): put it down to the side first,
             # or the next instruction (pick up a rod) starts with a full hand.
-            step = Step(self.stage, "put_down",
-                        f"put the {self.holding} down on the empty table beside the power strip, away from the "
-                        f"blocks and the balls, and open the gripper", self.holding, PUT_DOWN_TIMEOUT_S,
-                        needs_release=False, confirm_polls=2)
+            # It runs on the model of the stage whose step left the gripper closed (the cable model, whose demos drop
+            # each pulled cable to the side), with that model's own sentence when it has one: a switch to the next
+            # stage's model with a cable still in hand froze the arms while that model started on Dream's servers.
+            src = self.holding_stage or self.stage
+            text = self.m.stage_texts.get(src) or (
+                f"put the {self.holding} down on the empty table beside the power strip, away from the blocks and the "
+                f"balls, and open the gripper")
+            step = Step(src, "put_down", text, self.holding, PUT_DOWN_TIMEOUT_S, needs_release=False,
+                        confirm_polls=2)
         else:
             maker = {"unplug": self._next_unplug, "stack": self._next_stack, "balls": self._next_balls}[self.stage]
             step = maker(world, t)
@@ -168,7 +184,7 @@ class Relay:
             self._released_since_start, self._gripper_was_closed = False, False
             self.hold_from_s = t if step.kind == "hold" else None
             self.pending_confirm, self._confirmed = None, False
-            self._own_at_start = len(world.balls_in_bin(self.m.own_color))
+            self._own_at_start = self._scoring_in_bin(world)
             self._other_at_start = len(world.balls_in_bin(self.m.other_color()))
             self.log(t, f"step {step.kind} #{self.attempts[key]}: {step.instruction!r}")
         return step
@@ -200,12 +216,19 @@ class Relay:
         if self.time_left(t) < self.m.stop_margin_s:
             self.log(t, f"match clock nearly out ({self.time_left(t):.0f} s left): ending the step")
             return Outcome.FAILED
+        if step.kind == "unplug_more" and t - self._step_started_s > step.timeout_s:
+            # Time's up for pulling: close the stage (already passed at the first cable) and move on.
+            if min(gripper_open.values(), default=1.0) < 0.6:
+                self.holding, self.holding_stage = "orange USB cable", "unplug"
+            self.step = None
+            self._advance(t, f"a cable out at {self.cables_done_s:.0f} s, pulled more until {t - self.started_s:.0f} s")
+            return Outcome.PASSED
         if t - self._step_started_s > step.timeout_s:
             self.log(t, f"step {step.kind} timed out after {step.timeout_s:.0f} s")
             key = f"{step.kind}:{step.target}"
             if step.kind == "put_down" and self.attempts.get(key, 0) >= 2:
                 self.log(t, f"could not put the {self.holding} down; carrying on")
-                self.holding = None
+                self.holding = self.holding_stage = None
             if self.attempts.get(key, 0) > self.m.retries:
                 self.skipped.add(key)
                 self.log(t, f"skipping {key} after {self.attempts[key]} tries")
@@ -221,6 +244,15 @@ class Relay:
         else:
             self._good_polls = 0
 
+    def tower_standing_pass(self, world: World, t: float, why: str) -> bool:
+        """Claude saw the tower standing after the arms moved away (stack_all only): the stage passes."""
+        if self.step is None or self.step.kind != "stack_all":
+            return False
+        self.pending_confirm = None
+        self.log(t, f"Claude sees the tower standing with the arms away: {why}")
+        self._on_pass(self.step, world, t)
+        return True
+
     def external_pass(self, world: World, t: float, why: str) -> bool:
         """Claude saw the current step's goal met although the colour check did not (unplug only)."""
         if self.step is None or self.step.kind != "unplug":
@@ -231,6 +263,11 @@ class Relay:
 
     # ------------------------------------------------------------------ stage 1: unplug
     def _next_unplug(self, world: World, t: float) -> Step | None:
+        if self.cables_done_s is not None:
+            # More cables: the same words (Dream carries on, no reset), run until the time set, never "passed" early.
+            left = max(1.0, self.m.pull_cables_until_s - (t - self.started_s))
+            return Step("unplug", "unplug_more", self._unplug_step().instruction, "more", left, needs_release=False,
+                        confirm_polls=10**6)
         plugs = world.plugs_in_hub()
         later = world.of("cube") + world.of("rod") + world.of("ball") + world.of("eight_ball")
         ranked = sorted(plugs, key=lambda p: -world.nearest_cm(p, later))  # the most room around it first
@@ -245,8 +282,9 @@ class Relay:
 
     def _unplug_step(self) -> Step:
         """The unplug instruction, worded differently on each try (Dream-1 sometimes acts on one wording only)."""
-        if self.m.trained_unplug:  # the fine-tune's own demo text, word for word, and the same on every retry
-            return Step("unplug", "unplug", self.m.trained_unplug, "any", self.m.unplug_timeout_s)
+        text = self.m.stage_texts.get("unplug") or self.m.trained_unplug
+        if text:  # the fine-tune's own demo text, word for word, and the same on every retry
+            return Step("unplug", "unplug", text, "any", self.m.unplug_timeout_s)
         tries = self.attempts.get("unplug:any", 0)
         words = UNPLUG_WORDINGS[tries % len(UNPLUG_WORDINGS)]
         return Step("unplug", "unplug", f"{words} {AVOID['unplug']}", "any", self.m.unplug_timeout_s)
@@ -291,6 +329,12 @@ class Relay:
         return h + (self.cal.rod_length_in - self.cal.rod_insert_in if self.rod_color else 0.0)
 
     def _next_stack(self, world: World, t: float) -> Step | None:
+        text = self.m.stage_texts.get("stack")
+        if text:
+            # A fine-tune trained on whole-tower demos: one instruction, word for word, sent again (same words, so
+            # Dream carries on) until Claude confirms a tall, free-standing tower.
+            return Step("stack", "stack_all", text, "tower", self.m.stack_all_timeout_s, needs_release=False,
+                        confirm_polls=2)
         if not self.stack_order:
             self._plan_stack(world)
             self.log(t, f"plan: {self.log_plan}")
@@ -345,12 +389,17 @@ class Relay:
 
     # ------------------------------------------------------------------ stage 3: balls
     def _next_balls(self, world: World, t: float) -> Step | None:
+        trained = self.m.stage_texts.get("balls")
+        if trained:
+            # A fine-tune knows only its own sentence: send just that, every time. Its demos never took a ball back
+            # out, so no take-out or park steps (their words would be new to it); the bin is still counted.
+            return Step("balls", "ball", trained, self.m.own_color, self.m.step_timeout_s)
         if world.eight_ball_in_bin() or self.eight_ball_alert:
             self.eight_ball_alert = False
             return Step("balls", "take_out", "take the black ball out of the bin and put it on the table",
                         "eight_ball", self.m.step_timeout_s, needs_release=True)
         other = self.m.other_color()
-        if world.balls_in_bin(other) and self.time_left(t) > 20:
+        if not self.m.all_colors and world.balls_in_bin(other) and self.time_left(t) > 20:
             return Step("balls", "take_out", f"take the {spoken(other)} ping-pong ball out of the bin and put it on "
                         "the table", other, self.m.step_timeout_s)
         for white in world.avoid_in_bin():
@@ -358,15 +407,26 @@ class Relay:
                 return Step("balls", "take_out", f"take the {spoken(white.color)} ping-pong ball out of the bin and "
                             "put it on the table", white.color, self.m.step_timeout_s)
         eight, avoid = world.of("eight_ball"), world.of("avoid_ball")
-        candidates = [b for b in world.balls_on_table(self.m.own_color)
+        # A whole-stage ball model runs its own sentence and picks its own ball; parking because a white ball is near
+        # one would only waste the clock.
+        near_white_ok = self.m.all_colors and bool(self.m.stage_texts.get("balls"))
+        on_table = [b for c in self._scoring_colors() for b in world.balls_on_table(c)]
+        candidates = [b for b in on_table
                       if world.nearest_cm(b, eight) >= self.m.clear_of_eight_cm
-                      and world.nearest_cm(b, avoid) >= self.m.clear_of_avoid_cm]
+                      and (near_white_ok or world.nearest_cm(b, avoid) >= self.m.clear_of_avoid_cm)]
         if not candidates:
-            if world.balls_on_table(self.m.own_color):
+            if on_table:
                 self.log(t, "every own-colour ball left is next to a black or white ball; waiting")
             return Step("balls", "park", PARK, "none", 3.0, needs_release=False, confirm_polls=99)
-        return Step("balls", "ball", f"pick up the {spoken(self.m.own_color)} ping-pong ball and drop it in the bin "
-                    f"{AVOID['balls']}", self.m.own_color, self.m.step_timeout_s)
+        text = self.m.stage_texts.get("balls") or (f"pick up the {spoken(self.m.own_color)} ping-pong ball and drop "
+                                                   f"it in the bin {AVOID['balls']}")
+        return Step("balls", "ball", text, self.m.own_color, self.m.step_timeout_s)
+
+    def _scoring_colors(self) -> list[str]:
+        return list(self.cal.ball_colors) if self.m.all_colors else [self.m.own_color]
+
+    def _scoring_in_bin(self, world: World) -> int:
+        return sum(len(world.balls_in_bin(c)) for c in self._scoring_colors())
 
     # ------------------------------------------------------------------ checks
     def _check(self, step: Step, world: World, t: float) -> bool:
@@ -391,12 +451,16 @@ class Relay:
                        for c in mine)
         if step.kind == "put_down":
             return bool(self._last_grip) and min(self._last_grip.values()) >= 0.6
+        if step.kind == "stack_all":
+            # The colour check cannot measure a tower's height, so only Claude passes it ("tower_tall"): without
+            # Claude the step just runs on until the clock says stop, and the stage is never claimed.
+            return "stack_all" in self.confirm_kinds and t - self._step_started_s >= STACK_ALL_MIN_S
         if step.kind == "hold":
             if not self._tower_standing(world):
                 self.hold_from_s = t  # restart the 3 s whenever the tower is not seen standing
             return self.hold_from_s is not None and t - self.hold_from_s >= self.m.hold_s
         if step.kind == "ball":
-            return len(world.balls_in_bin(self.m.own_color)) > self._own_at_start
+            return self._scoring_in_bin(world) > self._own_at_start
         if step.kind == "take_out":
             if step.target == "eight_ball":
                 return not world.eight_ball_in_bin()
@@ -415,11 +479,18 @@ class Relay:
         self.log(t, f"step {step.kind} passed ({step.target})")
         still_closed = min(self._last_grip.values(), default=1.0) < 0.6
         if step.kind == "put_down":
-            self.holding = None
+            self.holding = self.holding_stage = None
         elif step.kind == "unplug" and still_closed:
-            self.holding = "orange USB cable"
+            self.holding, self.holding_stage = "orange USB cable", "unplug"
         if step.kind == "unplug":
-            self._advance(t, "a cable is out")
+            if self.m.pull_cables_until_s and t - self.started_s < self.m.pull_cables_until_s - 3.0:
+                # The stage's bar is met (later objects may be touched from now on); the cable model keeps pulling the
+                # rest until the time set, then the stage closes. holding is decided when it does.
+                self.holding = self.holding_stage = None
+                self.cables_done_s = t - self.started_s
+                self.log(t, f"a cable is out; pulling more until {self.m.pull_cables_until_s:.0f} s")
+            else:
+                self._advance(t, "a cable is out")
         elif step.kind in ("rod_in_cube", "rod_on_tower"):
             self.placed.append(f"rod:{self.rod_color}")
         elif step.kind == "place_cube":
@@ -427,8 +498,10 @@ class Relay:
             self.log(t, f"tower now {self.height_in():.1f} in: {self.placed}")
         elif step.kind == "hold":
             self._advance(t, f"tower {self.height_in():.1f} in, standing {self.m.hold_s:.0f} s")
+        elif step.kind == "stack_all":
+            self._advance(t, "Claude sees a tall tower standing on its own")
         elif step.kind in ("ball", "take_out"):
-            self.own_in_bin = len(world.balls_in_bin(self.m.own_color))
-            self.other_in_bin = len(world.balls_in_bin(self.m.other_color()))
+            self.own_in_bin = self._scoring_in_bin(world)
+            self.other_in_bin = 0 if self.m.all_colors else len(world.balls_in_bin(self.m.other_color()))
             self.log(t, f"bin: {self.own_in_bin} own, {self.other_in_bin} other; score {self.score()}")
         self.step = None

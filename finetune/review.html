@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ball Label Review</title>
+<style>
+  :root {
+    --bg: #f4f3ef; --panel: #ffffff; --ink: #1b1c1e; --muted: #6b6d72; --line: #e3e1da;
+    --accent: #2f5bd3; --ok: #1f8a4c; --ok-bg: #e5f4eb; --bad: #c2412d; --bad-bg: #fbe9e5; --track: #ecebe5;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121315; --panel: #1b1c1f; --ink: #ecebe7; --muted: #9a9ca2; --line: #2b2c30;
+      --accent: #7c9cff; --ok: #4cc37f; --ok-bg: #18301f; --bad: #ff7a63; --bad-bg: #3a1d18; --track: #26272b;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #121315; --panel: #1b1c1f; --ink: #ecebe7; --muted: #9a9ca2; --line: #2b2c30;
+    --accent: #7c9cff; --ok: #4cc37f; --ok-bg: #18301f; --bad: #ff7a63; --bad-bg: #3a1d18; --track: #26272b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  .wrap { max-width: 1320px; margin: 0 auto; padding: 16px; }
+  header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+  h1 { font-size: 17px; margin: 0; font-weight: 650; }
+  .bar { flex: 1; min-width: 160px; height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--ok); width: 0; transition: width .3s; }
+  .prog { font: 12px var(--mono); color: var(--muted); white-space: nowrap; }
+  .grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; align-items: start; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  .card h2 { font-size: 12px; font-weight: 650; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .stage { position: relative; background: #0c0c0d; border-radius: 8px; overflow: hidden; }
+  canvas { display: block; width: 100%; height: auto; cursor: crosshair; touch-action: none; }
+  .meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; font: 12px var(--mono); color: var(--muted); }
+  .tag { font: 600 10px var(--mono); padding: 3px 6px; border-radius: 4px; text-transform: uppercase; letter-spacing: .05em; background: var(--track); color: var(--muted); }
+  .tag.ok { background: var(--ok-bg); color: var(--ok); }
+  .tag.skip { background: var(--bad-bg); color: var(--bad); }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  button, select { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+                   border-radius: 8px; padding: 7px 12px; min-height: 36px; cursor: pointer; }
+  button.primary { background: var(--ok); border-color: var(--ok); color: #fff; font-weight: 650; }
+  button.danger { color: var(--bad); }
+  kbd { font: 11px var(--mono); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 1px 5px; background: var(--bg); }
+  .classes { display: grid; gap: 6px; }
+  .cls { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 8px; border: 1px solid transparent; cursor: pointer; }
+  .cls.on { border-color: var(--accent); }
+  .sw { width: 14px; height: 14px; border-radius: 50%; border: 1px solid rgba(127,127,127,.5); flex: none; }
+  .sw.cube { border-radius: 3px; }
+  .cls .n { margin-left: auto; font: 12px var(--mono); color: var(--muted); }
+  .boxes { display: grid; gap: 4px; max-height: 220px; overflow: auto; font: 12px var(--mono); }
+  .boxes div { display: flex; gap: 8px; align-items: center; padding: 4px 6px; border-radius: 6px; cursor: pointer; }
+  .boxes div.sel { background: var(--track); }
+  .filters { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .filters select { width: 100%; }
+  .help { font-size: 12px; color: var(--muted); line-height: 1.9; }
+  .stack { display: grid; gap: 16px; }
+  .empty { color: var(--muted); padding: 40px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Ball labels</h1>
+    <div class="bar"><i id="bar"></i></div>
+    <span class="prog" id="prog">…</span>
+  </header>
+  <div class="grid">
+    <section class="card">
+      <div class="stage"><canvas id="cv" width="640" height="360" aria-label="Frame with its boxes"></canvas></div>
+      <div class="meta"><span id="fname">–</span><span class="tag" id="fstatus">–</span><span class="tag" id="fsplit">–</span><span id="fpos"></span></div>
+      <div class="actions">
+        <button class="primary" id="accept">Looks right <kbd>Enter</kbd></button>
+        <button class="danger" id="skip">Skip frame <kbd>X</kbd></button>
+        <button id="prev">← Prev</button>
+        <button id="next">Next →</button>
+        <button id="clear">Remove all boxes</button>
+      </div>
+    </section>
+    <div class="stack">
+      <section class="card">
+        <h2>Show</h2>
+        <div class="filters">
+          <select id="fStatus" aria-label="Status"><option value="todo">To review</option><option value="all">All</option><option value="ok">Reviewed</option><option value="skip">Skipped</option></select>
+          <select id="fSplit" aria-label="Split"><option value="">Every split</option><option value="test">Test (score)</option><option value="val">Val</option><option value="train">Train</option></select>
+          <select id="fCam" aria-label="Camera"><option value="">Every camera</option><option value="scene">Overhead</option><option value="left_wrist">Left wrist</option><option value="right_wrist">Right wrist</option></select>
+        </div>
+      </section>
+      <section class="card">
+        <h2>Class for new boxes</h2>
+        <div class="classes" id="classes"></div>
+      </section>
+      <section class="card">
+        <h2>Boxes on this frame</h2>
+        <div class="boxes" id="boxes"></div>
+      </section>
+      <section class="card help">
+        <kbd>Enter</kbd> looks right, next · <kbd>X</kbd> skip (blurry, arm in the way)<br>
+        Drag to draw a box · click a box to pick it<br>
+        <kbd>1</kbd>–<kbd>5</kbd> set its class · <kbd>Del</kbd> remove it · <kbd>Tab</kbd> next box<br>
+        <kbd>←</kbd> <kbd>→</kbd> move without saving<br>
+        Review the <b>Test</b> frames first: they are what the score is measured on.
+      </section>
+    </div>
+  </div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const COL = { green_ball: "#00e676", orange_ball: "#ff8c00", white_ball: "#f2f2f2", black_ball: "#3a3a3a", green_cube: "#9ccc65",
+              blue_ball: "#1e6eff", yellow_ball: "#dce628", rod: "#e0503f", cube: "#b46fd6" };
+const NAME = { green_ball: "Green ball", orange_ball: "Orange ball", white_ball: "White ball", black_ball: "Black 8-ball", green_cube: "Green cube (decoy)",
+               blue_ball: "Blue ball", yellow_ball: "Yellow ball", rod: "Rod, any colour (decoy)", cube: "Blue/purple cube (decoy)" };
+let CLASSES = [], frames = [], view = [], idx = 0, cur = null, sel = -1, drawCls = "green_ball", img = new Image(), drag = null;
+const cv = $("cv"), ctx = cv.getContext("2d");
+
+async function loadFrames() {
+  const j = await (await fetch("/api/frames")).json();
+  frames = j.frames; CLASSES = j.classes;
+  $("classes").innerHTML = CLASSES.map((c, i) => `<div class="cls" data-c="${c}"><span class="sw ${c === "green_cube" ? "cube" : ""}" style="background:${COL[c]}"></span>${NAME[c]} <span class="n"><kbd>${i + 1}</kbd></span></div>`).join("");
+  document.querySelectorAll(".cls").forEach(el => el.onclick = () => setClass(el.dataset.c));
+  setClass(drawCls); refilter(); progress();
+}
+function refilter(keepName) {
+  const st = $("fStatus").value, sp = $("fSplit").value, cam = $("fCam").value;
+  view = frames.filter(f => (st === "all" || (st === "todo" ? (f.status === "auto" || f.status === "new") : f.status === st))
+    && (!sp || f.split === sp) && (!cam || f.camera === cam));
+  idx = Math.max(0, keepName ? view.findIndex(f => f.name === keepName) : 0);
+  show();
+}
+function progress() {
+  const done = frames.filter(f => f.status === "ok" || f.status === "skip").length;
+  const test = frames.filter(f => f.split === "test"), tdone = test.filter(f => f.status === "ok" || f.status === "skip").length;
+  $("bar").style.width = (100 * done / Math.max(1, frames.length)) + "%";
+  $("prog").textContent = `${done}/${frames.length} reviewed · test ${tdone}/${test.length}`;
+}
+async function show() {
+  if (!view.length) { cur = null; ctx.clearRect(0, 0, cv.width, cv.height); $("fname").textContent = "Nothing left to show with these filters."; $("boxes").innerHTML = ""; return; }
+  idx = Math.min(Math.max(0, idx), view.length - 1);
+  const f = view[idx];
+  cur = { name: f.name, ...(await (await fetch("/api/labels/" + encodeURIComponent(f.name))).json()) };
+  sel = -1;
+  img = new Image();
+  img.onload = () => { cv.width = img.naturalWidth; cv.height = img.naturalHeight; draw(); };
+  img.src = "/api/frame/" + encodeURIComponent(f.name);
+  $("fname").textContent = `ep ${f.episode} · ${f.camera.replace("_", " ")} · frame ${f.frame}`;
+  $("fstatus").textContent = cur.status; $("fstatus").className = "tag " + cur.status;
+  $("fsplit").textContent = cur.split;
+  $("fpos").textContent = `${idx + 1} of ${view.length}`;
+  list();
+}
+function draw() {
+  ctx.drawImage(img, 0, 0);
+  const lw = Math.max(2, cv.width / 320);
+  (cur?.boxes || []).forEach((b, i) => {
+    const [x0, y0, x1, y1] = b.box, c = COL[b.cls] || "#ff0";
+    ctx.lineWidth = i === sel ? lw * 2 : lw; ctx.strokeStyle = c;
+    ctx.setLineDash(["green_cube", "cube", "rod"].includes(b.cls) ? [6, 4] : []);
+    ctx.strokeRect(x0, y0, x1 - x0, y1 - y0); ctx.setLineDash([]);
+    const t = (b.cls.replace("_ball", "").replace("_", " ")) + (b.src && b.src !== "human" ? "" : " ✓");
+    ctx.font = `600 ${Math.round(cv.width / 55)}px ui-monospace, Menlo, monospace`;
+    const tw = ctx.measureText(t).width, th = cv.width / 45;
+    ctx.fillStyle = c; ctx.fillRect(x0, Math.max(0, y0 - th), tw + 6, th);
+    ctx.fillStyle = b.cls === "black_ball" ? "#fff" : "#000"; ctx.fillText(t, x0 + 3, Math.max(th - 3, y0 - 3));
+  });
+  if (drag && drag.moved) { ctx.strokeStyle = COL[drawCls]; ctx.lineWidth = lw; ctx.setLineDash([4, 3]); ctx.strokeRect(drag.x0, drag.y0, drag.x1 - drag.x0, drag.y1 - drag.y0); ctx.setLineDash([]); }
+}
+function list() {
+  $("boxes").innerHTML = (cur?.boxes || []).map((b, i) => `<div data-i="${i}" class="${i === sel ? "sel" : ""}"><span class="sw ${b.cls === "green_cube" ? "cube" : ""}" style="background:${COL[b.cls]}"></span>${b.cls}<span style="margin-left:auto;color:var(--muted)">${b.src || ""}</span></div>`).join("") || `<div style="color:var(--muted)">No boxes. Drag on the frame to add one.</div>`;
+  document.querySelectorAll("#boxes [data-i]").forEach(el => el.onclick = () => { sel = +el.dataset.i; draw(); list(); highlight(); });
+}
+function setClass(c) {  // a picked box takes the class; with none picked, new boxes do
+  if (sel >= 0 && cur) { cur.boxes[sel].cls = c; cur.boxes[sel].src = "human"; draw(); list(); }
+  else drawCls = c;
+  highlight();
+}
+function highlight() {
+  document.querySelectorAll(".cls").forEach(el => el.classList.toggle("on", el.dataset.c === (sel >= 0 && cur ? cur.boxes[sel].cls : drawCls)));
+}
+function pos(e) { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) * cv.width / r.width, (e.clientY - r.top) * cv.height / r.height]; }
+cv.addEventListener("pointerdown", e => { const [x, y] = pos(e); drag = { x0: x, y0: y, x1: x, y1: y, moved: false }; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener("pointermove", e => { if (!drag) return; const [x, y] = pos(e); drag.x1 = x; drag.y1 = y; drag.moved = Math.abs(x - drag.x0) + Math.abs(y - drag.y0) > 4; draw(); });
+cv.addEventListener("pointerup", e => {
+  if (!drag || !cur) { drag = null; return; }
+  const d = drag; drag = null;
+  if (d.moved) {
+    cur.boxes.push({ cls: drawCls, box: [Math.min(d.x0, d.x1), Math.min(d.y0, d.y1), Math.max(d.x0, d.x1), Math.max(d.y0, d.y1)], src: "human", score: 1 });
+    sel = cur.boxes.length - 1;
+  } else {  // a click: pick the smallest box under it
+    const hits = cur.boxes.map((b, i) => [i, b]).filter(([, b]) => d.x0 >= b.box[0] && d.x0 <= b.box[2] && d.y0 >= b.box[1] && d.y0 <= b.box[3]);
+    hits.sort((a, b) => (a[1].box[2] - a[1].box[0]) * (a[1].box[3] - a[1].box[1]) - (b[1].box[2] - b[1].box[0]) * (b[1].box[3] - b[1].box[1]));
+    sel = hits.length ? hits[0][0] : -1;
+  }
+  draw(); list(); highlight();
+});
+async function save(status) {
+  if (!cur) return;
+  const r = await fetch("/api/labels/" + encodeURIComponent(cur.name), { method: "POST", headers: { "Content-Type": "application/json", "X-Review": "1" }, body: JSON.stringify({ status, boxes: cur.boxes }) });
+  if (!r.ok) { alert("save failed: " + (await r.text())); return false; }
+  const f = frames.find(f => f.name === cur.name); f.status = status; f.n = cur.boxes.length;
+  progress();
+  return true;
+}
+async function decide(status) {
+  if (!(await save(status))) return;
+  if ($("fStatus").value === "todo") { view.splice(idx, 1); } else { idx++; }
+  show();
+}
+$("accept").onclick = () => decide("ok");
+$("skip").onclick = () => decide("skip");
+$("prev").onclick = () => { idx--; show(); };
+$("next").onclick = () => { idx++; show(); };
+$("clear").onclick = () => { if (cur) { cur.boxes = []; sel = -1; draw(); list(); } };
+// Blur after a change: a focused dropdown swallows the 1-5 class keys (and Enter) meant for the frame.
+["fStatus", "fSplit", "fCam"].forEach(id => $(id).onchange = () => { $(id).blur(); refilter(); });
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT") return;
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); decide("ok"); }
+  else if (e.key === "x" || e.key === "X") decide("skip");
+  else if (e.key === "ArrowRight") { idx++; show(); }
+  else if (e.key === "ArrowLeft") { idx--; show(); }
+  else if ((e.key === "Delete" || e.key === "Backspace") && sel >= 0 && cur) { e.preventDefault(); cur.boxes.splice(sel, 1); sel = -1; draw(); list(); highlight(); }
+  else if (e.key === "Tab" && cur?.boxes.length) { e.preventDefault(); sel = (sel + 1) % cur.boxes.length; draw(); list(); highlight(); }
+  else if (e.key === "Escape") { sel = -1; draw(); list(); highlight(); }
+  else if (/^[1-9]$/.test(e.key) && CLASSES[+e.key - 1]) setClass(CLASSES[+e.key - 1]);
+});
+loadFrames();
+</script>
+</body>
+</html>

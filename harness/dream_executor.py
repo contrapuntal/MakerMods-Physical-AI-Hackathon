@@ -27,7 +27,7 @@ import cv2
 from harness.claude_check import ClaudeVerifier
 from harness.config import MatchConfig
 from harness.relay import Outcome, Relay
-from harness import vision
+from harness import augment, vision
 
 _log = logging.getLogger(__name__)
 
@@ -37,7 +37,8 @@ POLL_S = 0.5
 
 
 async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_dir: pathlib.Path,
-                    station_config: pathlib.Path = STATION_CONFIG) -> Relay:
+                    station_config: pathlib.Path = STATION_CONFIG, augment_spec: str | None = None,
+                    augment_detector: str = "both") -> Relay:
     from robots import config as rconfig
     from robots import control, followers, home, run as rrun
     from robots import bodies
@@ -50,18 +51,36 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
 
     relay = Relay(match)
     app = rrun.with_task(rconfig.load(station_config), "hold the arms still")
-    dream_config = rrun.policy_config(app, checkpoint)
+
+    def model_for(stage: str) -> str:
+        return match.stage_models.get(stage) or checkpoint
+
+    models = list(dict.fromkeys(model_for(s) for s in relay.m_stages))  # each distinct model once, in stage order
     body = bodies.for_config(app)
     arms: dict = {}
     readers: list = []
     try:
         readers = await asyncio.to_thread(rrun.make_cameras, app)
         kin = rrun.make_kinematics(app)
-        client = await asyncio.to_thread(rrun.open_client, dream_config)
-        warmup = getattr(rrun, "TRAJ_WARMUP_S", None)  # only some dreamlabs versions compile the IK up front
-        if warmup is not None and hasattr(client, "wait_for_ik"):
-            if not await asyncio.to_thread(client.wait_for_ik, warmup):
-                _log.warning("the IK's traj solve did not compile in time; the arms open anyway")
+
+        async def open_model(model: str):
+            """A warmed Dream client for one model: opened before go for every stage's model, so a stage change
+            only swaps the client (about a second) instead of opening and compiling one mid-match."""
+            c = await asyncio.to_thread(rrun.open_client, rrun.policy_config(app, model))
+            c = _augmented(c, match, augment_spec, augment_detector, out_dir)
+            warmup = getattr(rrun, "TRAJ_WARMUP_S", None)  # only some dreamlabs versions compile the IK up front
+            if warmup is not None and hasattr(c, "wait_for_ik"):
+                if not await asyncio.to_thread(c.wait_for_ik, warmup):
+                    _log.warning("%s: the IK's traj solve did not compile in time; the arms open anyway", model)
+            return c
+
+        # Later stages' models go cold while earlier stages run (a cold one took up to 12 min to start): warm each on
+        # Dream's servers in the background now, by replaying the saved observation (harness/cloud_warm.py: no
+        # arms, its answers thrown away). Read before this run's loop overwrites the saved inputs.
+        if not dry_run:
+            _warm_later_stages(relay, model_for, match)
+        clients = {m: await open_model(m) for m in models}
+        _log.info("models: %s", {s: model_for(s) for s in relay.m_stages})
         open_arm = body.open_arm_read_only if dry_run and body.open_arm_read_only is not None else body.open_arm
         for name, arm_cfg in (("left", app.follower_l), ("right", app.follower_r)):
             arm = open_arm(arm_cfg, name)
@@ -89,7 +108,9 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
             raise RuntimeError("the relay has nothing to do at go")
         settings = rrun.loop_settings(app)
         # Dream-1 answered in up to ~4.3 s in practice: don't throw such a chunk away, and ride out a 20 s gap.
-        settings["action_timeout_s"] = max(settings.get("action_timeout_s") or 0, 5.0)
+        # Slow answers (6+ s seen at peak) beat a frozen arm: with gravity compensation lowered, a frozen arm sags onto
+        # the table, its joint reads as blocked and the arm's guard stops the run.
+        settings["action_timeout_s"] = max(settings.get("action_timeout_s") or 0, 8.0)
         settings["max_stall_ticks"] = max(settings.get("max_stall_ticks") or 0, 400)
         fault: Exception | None = None
         restarts = 0
@@ -97,16 +118,28 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         problem = await asyncio.to_thread(claude.probe)
         if problem:
             _log.warning("Claude vision checks off: %s", problem)
+        current = model_for(step.stage)
         while not stop.is_set():
             task = relay.step.instruction if relay.step else step.instruction
-            loop = control.ControlLoop(followers=arms, cameras=readers, client=client, task=task,
+            if relay.step is not None and model_for(relay.step.stage) != current:
+                relay.log(time.monotonic(), f"stage {relay.step.stage}: switching model {current} -> "
+                                            f"{model_for(relay.step.stage)}")
+                current = model_for(relay.step.stage)
+            stage_now = relay.step.stage if relay.step is not None else step.stage
+            if match.stage_gravity.get(stage_now) is not None:
+                from harness import gravity
+                if gravity.scale() != match.stage_gravity[stage_now]:
+                    relay.log(time.monotonic(), f"gravity compensation x{match.stage_gravity[stage_now]:g} for {stage_now}")
+                gravity.set_scale(match.stage_gravity[stage_now])
+            loop = control.ControlLoop(followers=arms, cameras=readers, client=clients[current], task=task,
                                        kinematics=kin, inference_log_path=app.inference_log_path, camera_owner=False,
                                        recorder=None, **settings)
             try:
                 async with loop:
                     runner = asyncio.create_task(loop.run(), name="dream-loop")
                     supervisor = asyncio.create_task(
-                        _supervise(loop, relay, match, stop, out_dir, claude, go_rgb=first.data), name="relay")
+                        _supervise(loop, relay, match, stop, out_dir, claude, go_rgb=first.data,
+                                   model_for=model_for, current=current), name="relay")
                     stopped = asyncio.create_task(stop.wait(), name="stop")
                     await asyncio.wait({runner, supervisor, stopped}, return_when=asyncio.FIRST_COMPLETED)
                     for t in (supervisor, stopped):
@@ -116,6 +149,41 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                     runner.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await runner
+                    result = supervisor.result() if supervisor.done() and not supervisor.cancelled() \
+                        and supervisor.exception() is None else None
+                    switch = result == "switch"
+                if result == "release":
+                    # Claude sees the cubes stacked, with the gripper still on them. Stop the model, send the arms
+                    # home (grippers open, away from the tower), then ask whether it stands on its own.
+                    t = time.monotonic()
+                    if not dry_run:
+                        relay.log(t, "stacked: arms home to let go of the tower")
+                        await asyncio.to_thread(home.return_to_home, arms, duration_s=home.HOME_DURATION_S)
+                    await asyncio.sleep(1.0)  # let the tower settle and the camera catch up
+                    after = next(r for r in readers if r.name == OVERHEAD).frame  # readers may be reopened
+                    t = time.monotonic()
+                    world = vision.detect(after.data, match.calibration, after.timestamp_s)
+                    wrist = {r.name: r.frame for r in readers if r.name != OVERHEAD}
+                    yes, why = await asyncio.to_thread(claude.ask, "standing_now", after.data, relay.stack_start_rgb,
+                                                       _wrists(wrist.get))
+                    cv2.imwrite(str(out_dir / f"tower_check_{'standing' if yes else 'not'}.jpg"),
+                                cv2.cvtColor(after.data, cv2.COLOR_RGB2BGR))
+                    if yes and relay.tower_standing_pass(world, t, why):
+                        nxt = relay.next_step(world, t)
+                        if nxt is None:
+                            stop.set()
+                    else:
+                        relay.resolve_confirm(False, f"after the arms moved away: {why}", t)
+                    continue
+                if switch:
+                    # The next stage runs on another model: a new loop on its client (not a restart). Both arms go
+                    # home first: every demo started there, and an arm left resting on the strip after a pull (it
+                    # sags low with gravity compensation off) blocked a joint and tripped the safety stop.
+                    if not dry_run:
+                        relay.log(time.monotonic(), "arms home before the next stage's model")
+                        if not await asyncio.to_thread(home.return_to_home, arms, duration_s=home.HOME_DURATION_S):
+                            relay.log(time.monotonic(), "an arm did not reach home; starting the next stage anyway")
+                    continue
             except (rerrors.ArmError, rerrors.SafetyStop):
                 raise  # a real arm fault or safety stop ends the run (the arms go home in the finally below)
             except rerrors.CameraError as exc:
@@ -153,11 +221,9 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                 if restarts > 3 or left < match.stop_margin_s + 10:
                     fault = exc
                     break
-                client = await asyncio.to_thread(rrun.open_client, dream_config)
-                # Warm the new client's IK first, as dreamcli does before the arms move: skipping it crashed the
+                # A fresh client, its IK warmed first as dreamcli does before the arms move: skipping it crashed the
                 # first answer of a restarted loop (SVD did not converge).
-                if not await asyncio.to_thread(client.wait_for_ik, rrun.TRAJ_WARMUP_S):
-                    _log.warning("restart: the IK's traj solve did not compile in time")
+                clients[current] = await open_model(current)
                 continue
             break
         if not dry_run:
@@ -171,6 +237,39 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
             control.run_teardown(f"switch {name} arm off", opened.torque_off)
         _write_report(relay, out_dir)
     return relay
+
+
+def _augmented(client, match: MatchConfig, spec: str | None, detector: str, out_dir: pathlib.Path):
+    """The Dream client, wrapped so the target ball is marked in what Dream sees (harness/augment.py) when asked."""
+    wrapped = augment.wrap(client, match.calibration, spec, detector=detector, debug_dir=out_dir / "sent")
+    if wrapped is not client:
+        _log.info("augmenting Dream's frames: %s (detector %s); samples in %s/sent", spec, detector, out_dir)
+    return wrapped
+
+
+def _warm_later_stages(relay: Relay, model_for, match: MatchConfig) -> None:
+    import threading
+    from harness import cloud_warm
+
+    start = relay.m_stages.index(match.start_stage) if match.start_stage in relay.m_stages else 0
+    later = list(dict.fromkeys(model_for(st) for st in relay.m_stages[start + 1:]))
+    later = [m for m in later if m != model_for(relay.m_stages[start])]
+    if not later:
+        return
+    try:
+        frames, state = cloud_warm.saved_observation()
+    except BaseException as exc:  # noqa: BLE001 - no saved inputs yet: nothing to warm with
+        _log.warning("background warm-up skipped: %s", exc)
+        return
+    out: dict[str, str] = {}
+    for st in relay.m_stages[start + 1:]:
+        m = model_for(st)
+        if m in later:
+            later.remove(m)
+            text = match.stage_texts.get(st) or "hold the arms still"
+            threading.Thread(target=cloud_warm.warm, args=(m, text, frames, state, out), daemon=True,
+                             name=f"warm-{st}").start()
+            _log.info("warming %s for the %s stage in the background", m, st)
 
 
 async def _reopen_cameras(rrun, app, readers: list, deadline_s: float) -> list | None:
@@ -214,14 +313,21 @@ async def _first_frame(reader, timeout_s: float = 10.0):
 
 
 async def _supervise(loop, relay: Relay, match: MatchConfig, stop: asyncio.Event, out_dir: pathlib.Path,
-                     claude: ClaudeVerifier, go_rgb=None) -> None:
+                     claude: ClaudeVerifier, go_rgb=None, model_for=None, current: str | None = None) -> str | None:
+    """Feeds the relay until the match ends (returns None) or the next step needs another model ("switch")."""
+    def needs_switch(step) -> bool:
+        return model_for is not None and step is not None and model_for(step.stage) != current
+
     if claude.available:
-        relay.confirm_kinds = {"unplug", "hold"}  # the two pass bars that, if wrong, mean a DQ or a lost +20
+        # The pass bars that, if wrong, mean a DQ or a lost +20 (stack_all: only Claude can pass it).
+        relay.confirm_kinds = {"unplug", "hold", "stack_all"}
         _log.info("Claude vision checks on (%s)", "unplug and tower confirmations, 8-ball watch")
     else:
         _log.info("Claude vision checks off (no key); colour checks only")
     pending: dict[str, asyncio.Task] = {}  # question -> running Claude call
     last_unplug_ask = 0.0
+    no_ball_since: float | None = None  # balls stage: when the camera last stopped seeing a coloured ball on the table
+    last_balls_ask = 0.0
     saved = len(list(out_dir.glob("step_*.jpg")))  # carries on numbering after a loop restart
     while not stop.is_set():
         await asyncio.sleep(POLL_S)
@@ -231,6 +337,8 @@ async def _supervise(loop, relay: Relay, match: MatchConfig, stop: asyncio.Event
             continue
         now = time.monotonic()
         world = vision.detect(frame.data, match.calibration, frame.timestamp_s)
+        if relay.stack_start_rgb is None and relay.step is not None and relay.step.kind == "stack_all":
+            relay.stack_start_rgb = frame.data.copy()  # the table as stacking begins, for Claude's comparisons
         # Collect Claude answers that came back since the last poll.
         for question, task in list(pending.items()):
             if not task.done():
@@ -240,11 +348,26 @@ async def _supervise(loop, relay: Relay, match: MatchConfig, stop: asyncio.Event
             if not claude.available:
                 relay.confirm_kinds.clear()  # Claude went away mid-run: the colour checks decide from here
             if question in ("confirm",):
+                if relay.pending_confirm == "stack_all" and match.stack_pass != "6in":
+                    if yes:
+                        relay.log(now, f"Claude sees the cubes stacked: {why}")
+                        for other in pending.values():
+                            other.cancel()
+                        return "release"
+                    relay.resolve_confirm(False, why, now)
+                    continue
                 # No opinion (unreachable, out of credit) counts as a yes: the colour check already passed.
                 relay.resolve_confirm(yes is not False, why, now)
             elif question == "unplugged_since" and yes:
-                if relay.external_pass(world, now, why):
-                    _next(loop, relay, world, now, stop)
+                if relay.external_pass(world, now, why) and _next(loop, relay, world, now, stop, needs_switch):
+                    return "switch"
+            elif question == "balls_left":
+                if yes is False:
+                    relay.log(now, f"no coloured ball left within reach: {why}; ending the run (arms home)")
+                    stop.set()
+                    break
+                relay.log(now, f"Claude sees balls still within reach: {why}")
+                no_ball_since = None
             elif question == "eight_ball_in_bin" and yes:
                 relay.log(now, f"Claude sees the 8-ball in the bin: {why}")
                 relay.eight_ball_alert = True
@@ -252,10 +375,27 @@ async def _supervise(loop, relay: Relay, match: MatchConfig, stop: asyncio.Event
             if relay.pending_confirm and "confirm" not in pending:
                 if relay.pending_confirm == "unplug":  # compared with go: a cable already out at go doesn't count
                     call = (claude.ask, "unplugged_since", frame.data, go_rgb)
+                elif relay.pending_confirm == "stack_all" and match.stack_pass != "6in" \
+                        and relay.stack_start_rgb is not None:
+                    # Is it stacked (the gripper may still be on it)? A yes stops the model and checks it standing.
+                    call = (claude.ask, "stacked_now", frame.data, relay.stack_start_rgb, _wrists(loop.video.get))
+                elif relay.pending_confirm == "stack_all":
+                    call = (claude.ask, "tower_tall" if match.stack_pass == "6in" else "tower", frame.data)
                 else:
                     call = (claude.ask, "tower", frame.data)
                 pending["confirm"] = asyncio.create_task(asyncio.to_thread(*call))
             step = relay.step
+            if relay.stage == "balls" and match.all_colors:
+                # Balls can roll out of reach: when the camera sees none on the table for 8 s, ask Claude whether any
+                # is still reachable; a no ends the run with the score kept, instead of the model wandering.
+                seen = [b for c in match.calibration.ball_colors for b in world.balls_on_table(c)]
+                no_ball_since = None if seen else (no_ball_since or now)
+                if no_ball_since and now - no_ball_since >= 8.0 and now - last_balls_ask > 10.0 \
+                        and "balls_left" not in pending:
+                    last_balls_ask = now
+                    wrist = _wrists(loop.video.get)
+                    pending["balls_left"] = asyncio.create_task(
+                        asyncio.to_thread(claude.ask, "balls_left", frame.data, None, wrist))
             if step and step.kind == "unplug" and go_rgb is not None and now - last_unplug_ask > 5.0 \
                     and "unplugged_since" not in pending:
                 last_unplug_ask = now
@@ -274,21 +414,40 @@ async def _supervise(loop, relay: Relay, match: MatchConfig, stop: asyncio.Event
             pending["eight_ball_in_bin"] = asyncio.create_task(
                 asyncio.to_thread(claude.ask, "eight_ball_in_bin", frame.data))
         del finished
-        _next(loop, relay, world, now, stop)
+        if _next(loop, relay, world, now, stop, needs_switch):
+            for task in pending.values():
+                task.cancel()
+            return "switch"
     for task in pending.values():
         task.cancel()
+    return None
 
 
-def _next(loop, relay: Relay, world, now: float, stop: asyncio.Event) -> None:
+def _wrists(get) -> list:
+    """The wrist cameras' newest frames (side views of the table) for Claude, as RGB arrays; missing ones skipped."""
+    out = []
+    for name in ("wrist_l", "wrist_r"):
+        frame = get(name)
+        if frame is not None and getattr(frame, "data", None) is not None:
+            out.append(frame.data)
+    return out
+
+
+def _next(loop, relay: Relay, world, now: float, stop: asyncio.Event, needs_switch=lambda step: False) -> bool:
+    """Moves the relay on; True when the new step belongs to another model (the caller swaps loops, so the old
+    model never starts on it)."""
     step = relay.next_step(world, now)
     if step is None:
         relay.log(now, f"done: score {relay.score()} (stages passed: {list(relay.passed)})")
         stop.set()
-        return
+        return False
+    if needs_switch(step):
+        return True
     # Dream starts a fresh episode on every set_task(), even with the same words, dropping the move in progress.
     # A retry of the same instruction therefore just lets Dream-1 carry on.
     if step.instruction != loop.task:
         loop.set_task(step.instruction)
+    return False
 
 
 def _write_report(relay: Relay, out_dir: pathlib.Path) -> None:
