@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import pathlib
+import signal
 import sys
 import time
 
@@ -66,6 +67,8 @@ def main(argv: list[str] | None = None) -> None:
         out = args.out or pathlib.Path("~/hackathon_runs").expanduser() / time.strftime("%Y%m%d-%H%M%S")
         ctl = FreezeControl()
         ctl.install_freeze_signal()
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):  # an end before run_match's handlers exist
+            signal.signal(signum, lambda signum, frame: ctl.request_end())
         state = StateFile(out)
         state.update(state="starting", pid=os.getpid(), started_at=time.time(), dry_run=args.dry_run,
                      freeze_supported=True, stage=None, score=None, alarm=None, error=None, version=1)

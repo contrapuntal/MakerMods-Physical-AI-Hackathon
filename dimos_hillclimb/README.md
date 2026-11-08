@@ -97,12 +97,13 @@ gripper opens, 25 s timeout).
 
 `harness run` can be driven from outside (for example a voice front end) with signals and a state file:
 
-- `SIGUSR1` freezes the arms in place: they hold the measured pose, with no home move and no switch-off. It works even
+- `SIGUSR1` freezes the arms where they are, with no home move and no switch-off. Expect a brief settling motion while
+  the driver eases back to the measured pose, not an instant stop. It works even
   before the heavy imports finish; a freeze before the arms open aborts the run.
 - `SIGINT`, `SIGTERM` and `SIGHUP` end the run: home, then park (switch off). After a freeze, an end request homes from
-  the hold; a freeze during that home holds again. Once the park has started it can't be interrupted.
+  the hold; a freeze during that home holds again. Once the park has started it can't be interrupted; a freeze then is only recorded in `alarm`.
 - `<run_dir>/state.json` (written atomically) has `version`, `state`, `pid`, `started_at`, `stage`, `dry_run`,
-  `freeze_supported`, `score`, `alarm`, `error`, `updated_at`. `state` is one of `starting`, `running`, `frozen`,
+  `freeze_supported`, `score`, `alarm`, `fault` (only on the fault-while-frozen path), `error`, `updated_at`. `state` is one of `starting`, `running`, `frozen`,
   `homing`, `parking`, `done`, `error`. The symlink `~/.dreamlabs/current-harness-run` points at the run dir
   (`~/hackathon_runs/<time>` unless `--out`).
 - `~/.dreamlabs/arms.lock` (holder `harness run`) keeps `dreamcli robot run` and `harness run` off the arms at once.

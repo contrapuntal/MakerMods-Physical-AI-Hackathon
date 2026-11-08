@@ -126,7 +126,10 @@ def first_alarm(arms: dict) -> str | None:
     for name, arm in arms.items():
         if not arm.is_alive():
             return f"{name}: not answering"
-        alarm = arm.alarm()
+        try:
+            alarm = arm.alarm()
+        except AttributeError:  # Dream's DryRun driver has no alarm(): that arm has none to report
+            continue
         if alarm:
             return alarm if name in alarm else f"{name}: {alarm}"
     return None

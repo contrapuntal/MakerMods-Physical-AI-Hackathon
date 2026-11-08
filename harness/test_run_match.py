@@ -1051,3 +1051,30 @@ def test_config_load_failure_releases_lock_and_handlers(stub_dream, tmp_path, mo
 def test_terminal_state_is_written_before_the_lock_is_released(stub_dream, tmp_path):
     run(stub_dream, tmp_path)
     assert stub_dream.order.index("state:done") < stub_dream.order.index("lock_released")
+
+
+def test_freeze_during_the_final_park_is_recorded_as_an_alarm(stub_dream, tmp_path, ctl, monkeypatch):
+    logs: list[str] = []
+    monkeypatch.setattr(StubRelay, "log", lambda self, t, what: logs.append(what))
+    sent: list[bool] = []
+
+    def torque_off(self) -> None:
+        self.world.calls.append("torque_off")
+        if not sent:
+            sent.append(True)
+            freeze(ctl)  # a freeze arrives mid-park: the park cannot be stopped
+
+    monkeypatch.setattr(StubArm, "torque_off", torque_off)
+    run(stub_dream, tmp_path, ctl)
+    assert stub_dream.calls.count("torque_off") == 2  # the park still ran to the end
+    final = stub_dream.states[-1]
+    assert final["state"] == "done" and "freeze arrived during the park" in (final["alarm"] or "")
+    assert any("freeze arrived during the park" in m for m in logs)
+
+
+def test_debugview_any_exception_is_a_warning(stub_dream, tmp_path, caplog):
+    stub_dream.view_error = RuntimeError("bad init")
+    with caplog.at_level(logging.WARNING):
+        run(stub_dream, tmp_path)
+    assert "open_arm" in stub_dream.calls and stub_dream.states[-1]["state"] == "done"
+    assert any("debug view" in r.message for r in caplog.records)

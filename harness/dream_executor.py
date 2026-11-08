@@ -109,8 +109,8 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         try:
             view = dream.DebugView(client, port=VIEW_PORT)
             _log.info("what the model sees: %s", view.url)
-        except OSError as exc:
-            _log.warning("debug view cannot listen on port %d (%s); carrying on without it", VIEW_PORT, exc)
+        except Exception as exc:  # noqa: BLE001 - a debug view must never kill a run
+            _log.warning("debug view cannot start on port %d (%s); carrying on without it", VIEW_PORT, exc)
         if ctl.frozen:  # a freeze while the harness was starting: the arms are never opened
             done_error = "frozen before the arms opened"
             relay.log(time.monotonic(), done_error)
@@ -299,6 +299,10 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                 view.close()
         for name, opened in arms.items():
             control.run_teardown(f"switch {name} arm off", opened.torque_off)
+        if arms and ctl.frozen:  # a freeze arrived during the park, which cannot be stopped: say so
+            msg = "freeze arrived during the park; the park cannot be stopped"
+            relay.log(time.monotonic(), msg)
+            _set_state(state, alarm=msg)
         try:
             _write_report(relay, out_dir)
         except BaseException as exc:

@@ -156,6 +156,24 @@ def test_first_alarm():
     assert first_alarm({"left": ok}) is None
 
 
+def test_first_alarm_arm_without_alarm_is_no_alarm_and_quiet(caplog):
+    class NoAlarm:
+        def is_alive(self):
+            return True
+
+        def alarm(self):
+            raise AttributeError("no alarm in a dry run")
+
+    hot = SimpleNamespace(alarm=lambda: "over temp", is_alive=lambda: True)
+    with caplog.at_level("DEBUG"):
+        assert first_alarm({"left": NoAlarm()}) is None
+        assert first_alarm({"left": NoAlarm(), "right": hot}) == "right: over temp"
+    assert not caplog.records
+    boom = SimpleNamespace(alarm=lambda: (_ for _ in ()).throw(ValueError("x")), is_alive=lambda: True)
+    with pytest.raises(ValueError):
+        first_alarm({"left": boom})
+
+
 def test_main_installs_freeze_before_heavy_imports(tmp_path):
     code = (
         "import json, signal, sys\n"
@@ -204,3 +222,39 @@ def test_state_update_survives_unserialisable_value(tmp_path):
     state.update(state="error", error="boom")  # a failed write must not poison later ones
     on_disk = json.loads((tmp_path / "run" / "state.json").read_text())
     assert on_disk["state"] == "error" and "score" not in on_disk
+
+
+@pytest.mark.parametrize("sig", ["SIGTERM", "SIGINT", "SIGHUP"])
+def test_end_signal_during_heavy_imports_is_a_clean_done(tmp_path, sig):
+    code = (
+        "import json, os, signal, sys, types\n"
+        "class Empty:\n"
+        "    def create_module(self, spec): return types.ModuleType('cv2')\n"
+        "    def exec_module(self, module): pass\n"
+        "class Blocker:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        f"        if name == 'cv2':\n"
+        f"            os.kill(os.getpid(), signal.{sig})  # an end signal while the heavy imports run\n"
+        "            import importlib.util\n"
+        "            return importlib.util.spec_from_loader('cv2', Empty())\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Blocker())\n"
+        "import harness.__main__ as m\n"
+        "stub = types.ModuleType('harness.dream_executor')\n"
+        "async def run_match(match, ckpt, dry_run, out_dir, ctl, state):\n"
+        "    assert ctl.end_requested.is_set()\n"
+        "    state.update(state='done', error='ended before the arms opened')\n"
+        "    raise SystemExit(0)\n"
+        "stub.run_match = run_match\n"
+        "sys.modules['harness.dream_executor'] = stub\n"
+        f"out = {str(tmp_path / 'run')!r}\n"
+        "try:\n"
+        "    m.main(['run', '--out', out])\n"
+        "except SystemExit:\n"
+        "    pass\n"
+        "st = json.load(open(out + '/state.json'))\n"
+        "assert st['state'] == 'done', st\n"
+    )
+    env = {**os.environ, "HOME": str(tmp_path)}
+    res = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True, text=True, timeout=60, env=env)
+    assert res.returncode == 0, (res.returncode, res.stderr)
