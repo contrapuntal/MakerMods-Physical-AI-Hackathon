@@ -81,19 +81,19 @@ class StateFile:
         self.data: dict[str, Any] = {}
 
     def update(self, **fields: Any) -> dict:
-        self.data.update(fields)
-        self.data["updated_at"] = time.time()
+        payload = {**self.data, **fields, "updated_at": time.time()}  # committed only once the write succeeds
         self.out_dir.mkdir(parents=True, exist_ok=True)
         path = self.out_dir / "state.json"
         fd, tmp = tempfile.mkstemp(dir=self.out_dir, suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
-                json.dump(self.data, f)
+                json.dump(payload, f)
             os.replace(tmp, path)
         except BaseException:
             if os.path.exists(tmp):
                 os.unlink(tmp)
             raise
+        self.data = payload
         return dict(self.data)
 
     def link_current(self) -> None:

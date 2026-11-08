@@ -192,3 +192,13 @@ def test_main_help_text():
     res = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True, text=True, timeout=60)
     assert res.returncode == 0, res.stderr
     assert "SIGUSR1 freezes the arms" in " ".join(res.stdout.split())
+
+
+def test_state_update_survives_unserialisable_value(tmp_path):
+    state = StateFile(tmp_path / "run", link=tmp_path / "link")
+    state.update(state="running")
+    with pytest.raises(TypeError):
+        state.update(score=object())
+    state.update(state="error", error="boom")  # a failed write must not poison later ones
+    on_disk = json.loads((tmp_path / "run" / "state.json").read_text())
+    assert on_disk["state"] == "error" and "score" not in on_disk

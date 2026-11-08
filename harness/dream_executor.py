@@ -34,6 +34,17 @@ _log = logging.getLogger(__name__)
 STATION_CONFIG = pathlib.Path("~/.dreamlabs/station.yaml").expanduser()
 OVERHEAD = "scene"  # the overhead camera's name in the station config
 POLL_S = 0.5
+VIEW_PORT = 8093  # Dream's DebugView: what the model sees (the page `dreamcli robot run --view` serves)
+
+
+def _set_state(statefile, /, **fields) -> None:
+    """Writes state.json when there is one; a failed write is logged, never allowed to break the run or its teardown."""
+    if statefile is None:
+        return
+    try:
+        statefile.update(**fields)
+    except Exception:  # noqa: BLE001
+        _log.exception("could not write state.json")
 
 
 async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_dir: pathlib.Path,
@@ -42,8 +53,17 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
     from robots import control, followers, home, run as rrun
     from robots import bodies
     from robots import errors as rerrors
+    from robots import arms_lock
+    import dream
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    # One holder of the arms at a time, as `dreamcli robot run` does; released last, after the arms switch off.
+    lock = contextlib.ExitStack()
+    try:
+        lock.enter_context(arms_lock.holding(pathlib.Path("~/.dreamlabs/arms.lock").expanduser(), "harness run"))
+    except Exception as exc:  # noqa: BLE001 - held by dreamcli or the station agent: nothing is opened
+        _set_state(state, state="error", error=str(exc))
+        raise
     stop = asyncio.Event()
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         asyncio.get_running_loop().add_signal_handler(signum, stop.set)
@@ -54,6 +74,8 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
     body = bodies.for_config(app)
     arms: dict = {}
     readers: list = []
+    view = None
+    error: str | None = None
     try:
         readers = await asyncio.to_thread(rrun.make_cameras, app)
         kin = rrun.make_kinematics(app)
@@ -62,6 +84,11 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         if warmup is not None and hasattr(client, "wait_for_ik"):
             if not await asyncio.to_thread(client.wait_for_ik, warmup):
                 _log.warning("the IK's traj solve did not compile in time; the arms open anyway")
+        try:
+            view = dream.DebugView(client, port=VIEW_PORT)
+            _log.info("what the model sees: %s", view.url)
+        except OSError as exc:
+            _log.warning("debug view cannot listen on port %d (%s); carrying on without it", VIEW_PORT, exc)
         open_arm = body.open_arm_read_only if dry_run and body.open_arm_read_only is not None else body.open_arm
         for name, arm_cfg in (("left", app.follower_l), ("right", app.follower_r)):
             arm = open_arm(arm_cfg, name)
@@ -93,6 +120,7 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         settings["max_stall_ticks"] = max(settings.get("max_stall_ticks") or 0, 400)
         fault: Exception | None = None
         restarts = 0
+        _set_state(state, state="running", stage=relay.stage)
         claude = ClaudeVerifier()
         problem = await asyncio.to_thread(claude.probe)
         if problem:
@@ -106,7 +134,7 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                 async with loop:
                     runner = asyncio.create_task(loop.run(), name="dream-loop")
                     supervisor = asyncio.create_task(
-                        _supervise(loop, relay, match, stop, out_dir, claude, go_rgb=first.data), name="relay")
+                        _supervise(loop, relay, match, stop, out_dir, claude, go_rgb=first.data, state=state), name="relay")
                     stopped = asyncio.create_task(stop.wait(), name="stop")
                     await asyncio.wait({runner, supervisor, stopped}, return_when=asyncio.FIRST_COMPLETED)
                     for t in (supervisor, stopped):
@@ -160,16 +188,29 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
                     _log.warning("restart: the IK's traj solve did not compile in time")
                 continue
             break
+        _set_state(state, state="homing")
         if not dry_run:
             await asyncio.to_thread(home.return_to_home, arms, duration_s=home.HOME_DURATION_S)
         if fault is not None:
             raise fault
+    except BaseException as exc:
+        error = str(exc) or type(exc).__name__
+        raise
     finally:
+        _set_state(state, state="parking")
         for reader in readers:
             reader.stop()
+        if view is not None:
+            with contextlib.suppress(Exception):
+                view.close()
         for name, opened in arms.items():
             control.run_teardown(f"switch {name} arm off", opened.torque_off)
         _write_report(relay, out_dir)
+        lock.close()
+        if error is None:
+            _set_state(state, state="done", score=int(relay.score()))
+        else:
+            _set_state(state, state="error", error=error)
     return relay
 
 
@@ -214,7 +255,7 @@ async def _first_frame(reader, timeout_s: float = 10.0):
 
 
 async def _supervise(loop, relay: Relay, match: MatchConfig, stop: asyncio.Event, out_dir: pathlib.Path,
-                     claude: ClaudeVerifier, go_rgb=None) -> None:
+                     claude: ClaudeVerifier, go_rgb=None, state=None) -> None:
     if claude.available:
         relay.confirm_kinds = {"unplug", "hold"}  # the two pass bars that, if wrong, mean a DQ or a lost +20
         _log.info("Claude vision checks on (%s)", "unplug and tower confirmations, 8-ball watch")
@@ -223,8 +264,12 @@ async def _supervise(loop, relay: Relay, match: MatchConfig, stop: asyncio.Event
     pending: dict[str, asyncio.Task] = {}  # question -> running Claude call
     last_unplug_ask = 0.0
     saved = len(list(out_dir.glob("step_*.jpg")))  # carries on numbering after a loop restart
+    stage = relay.stage
     while not stop.is_set():
         await asyncio.sleep(POLL_S)
+        if relay.stage != stage:
+            stage = relay.stage
+            _set_state(state, stage=stage)
         frame = loop.video.get(OVERHEAD)
         state = loop.state
         if frame is None or state is None:
