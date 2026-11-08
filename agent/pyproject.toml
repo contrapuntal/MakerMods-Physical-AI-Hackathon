@@ -1,0 +1,46 @@
+[project]
+name = "pah2026"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dreamlabs>=1.0.37",
+    "lerobot-robot-livekit>=0.3.0",
+    "livekit-agents[openai,silero,turn-detector]~=1.8",
+    "livekit-plugins-ai-coustics~=0.3",
+    "livekit-portal>=0.3.0",
+    "python-dotenv>=1.2.4",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+]
+
+[tool.uv]
+# mirrored from agent-starter-python: yarl 1.24.1 has only a cp310 wheel
+constraint-dependencies = ["yarl<1.24"]
+
+# CPU-only torch (eGPU does not travel to the event); pulled in by lerobot
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+    "ruff>=0.17.4",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
