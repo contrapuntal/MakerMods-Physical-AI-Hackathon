@@ -37,7 +37,7 @@ POLL_S = 0.5
 
 
 async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_dir: pathlib.Path,
-                    station_config: pathlib.Path = STATION_CONFIG) -> Relay:
+                    station_config: pathlib.Path = STATION_CONFIG, ctl=None, state=None) -> Relay:
     from robots import config as rconfig
     from robots import control, followers, home, run as rrun
     from robots import bodies
