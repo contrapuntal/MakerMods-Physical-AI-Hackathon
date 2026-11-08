@@ -20,6 +20,7 @@ import json
 import logging
 import pathlib
 import signal
+import threading
 import time
 
 import cv2
@@ -37,6 +38,7 @@ OVERHEAD = "scene"  # the overhead camera's name in the station config
 POLL_S = 0.5
 FROZEN_POLL_S = 0.5  # how often the frozen wait looks for an end request
 ALARM_POLL_S = 1.0  # ... and for an arm alarm
+PROBE_TIMEOUT_S = 5.0  # the most any path (start, freeze, end) waits for the Claude probe
 VIEW_PORT = 8093  # Dream's DebugView: what the model sees (the page `dreamcli robot run --view` serves)
 
 
@@ -70,10 +72,22 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         lock.enter_context(arms_lock.holding(pathlib.Path("~/.dreamlabs/arms.lock").expanduser(), "harness run"))
     except Exception as exc:  # noqa: BLE001 - held by dreamcli or the station agent: nothing is opened
         _set_state(state, state="error", error=str(exc))
+        if state is not None:  # the live holder's run is the current one, not this refused start
+            try:
+                state.restore_link()
+            except Exception:  # noqa: BLE001
+                _log.exception("could not restore the current-run link")
         raise
     stop = asyncio.Event()
     aloop = asyncio.get_running_loop()
-    ctl.on_freeze = lambda: aloop.call_soon_threadsafe(stop.set)  # only wakes the loop: no arm or file work here
+
+    def _woken() -> None:
+        """Runs on the loop thread, never in the signal handler: wake the loop, and say `freezing` until `frozen`."""
+        stop.set()
+        if state is not None and state.data.get("state") in ("starting", "running", "homing"):
+            _set_state(state, state="freezing")  # not while frozen/parking/done: a repeat freeze changes nothing
+
+    ctl.on_freeze = lambda: aloop.call_soon_threadsafe(_woken)  # the handler itself does no arm or file work
     # The end signals use signal.signal like SIGUSR1 (not loop.add_signal_handler, whose callback is deferred until
     # the loop runs): both run on the main thread as soon as it is free. Pending handlers run in signal-number
     # order, not arrival order, so a SIGTERM racing a freeze while already frozen can still end the run (our agent
@@ -94,14 +108,34 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
     view = None
     error: str | None = None
     done_error: str | None = None  # a clean abort: written with state "done"
+    done_reason: str | None = None  # ... and its machine-readable reason
+
+    def abort_before_open() -> bool:
+        """A freeze or an end that arrived before any arm opened: nothing to hold, home or park."""
+        nonlocal done_error, done_reason
+        if ctl.frozen:
+            done_error, done_reason = "frozen before the arms opened", "frozen_before_open"
+        elif ctl.end_requested.is_set() or stop.is_set():
+            done_error, done_reason = "ended before the arms opened", "ended_before_open"
+        else:
+            return False
+        relay.log(time.monotonic(), done_error)
+        return True
+
     fault: Exception | None = None
     try:
         app = rrun.with_task(rconfig.load(station_config), "hold the arms still")
         dream_config = rrun.policy_config(app, checkpoint)
         body = bodies.for_config(app)
+        if abort_before_open():  # checked before each slow step: no cameras, client or IK work for a dead run
+            return relay
         readers = await asyncio.to_thread(rrun.make_cameras, app)
         kin = rrun.make_kinematics(app)
+        if abort_before_open():
+            return relay
         client = await asyncio.to_thread(rrun.open_client, dream_config)
+        if abort_before_open():
+            return relay
         warmup = getattr(rrun, "TRAJ_WARMUP_S", None)  # only some dreamlabs versions compile the IK up front
         if warmup is not None and hasattr(client, "wait_for_ik"):
             if not await asyncio.to_thread(client.wait_for_ik, warmup):
@@ -111,13 +145,7 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
             _log.info("what the model sees: %s", view.url)
         except Exception as exc:  # noqa: BLE001 - a debug view must never kill a run
             _log.warning("debug view cannot start on port %d (%s); carrying on without it", VIEW_PORT, exc)
-        if ctl.frozen:  # a freeze while the harness was starting: the arms are never opened
-            done_error = "frozen before the arms opened"
-            relay.log(time.monotonic(), done_error)
-            return relay
-        if ctl.end_requested.is_set() or stop.is_set():  # an end before the arms open: nothing to home or park
-            done_error = "ended before the arms opened"
-            relay.log(time.monotonic(), done_error)
+        if abort_before_open():  # a freeze or end while the harness was starting: the arms are never opened
             return relay
         open_arm = body.open_arm_read_only if dry_run and body.open_arm_read_only is not None else body.open_arm
         # `starting` means no arm has been touched: say so before the first open.
@@ -166,14 +194,9 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         restarts = 0
         _set_state(state, state="running", stage=relay.stage)
         claude = ClaudeVerifier()
-        probe = asyncio.create_task(asyncio.to_thread(claude.probe), name="claude-probe")
-        probe.add_done_callback(lambda t: t.cancelled() or t.exception())  # an abandoned probe's error is not news
-        woke = asyncio.create_task(stop.wait(), name="probe-wake")
-        await asyncio.wait({probe, woke}, return_when=asyncio.FIRST_COMPLETED)
-        woke.cancel()
+        problem = await _probe_claude(claude, stop, PROBE_TIMEOUT_S)  # a freeze or end abandons it; at most ~5 s
         if ctl.frozen:
-            raise FreezeRequested  # frozen during the probe: abandon it, never start the loop
-        problem = await probe  # an end during the probe just waits it out (a few seconds at most)
+            raise FreezeRequested  # frozen during the probe: abandoned, the loop never starts
         if problem:
             _log.warning("Claude vision checks off: %s", problem)
         if ctl.frozen:
@@ -303,7 +326,7 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
             msg = "freeze arrived during the park; the park cannot be stopped"
             relay.log(time.monotonic(), msg)
             if error is None and not done_error:  # never `alarm`: that reads as an arm fault after the arms are off
-                done_error = msg
+                done_error, done_reason = msg, "freeze_during_park"
         try:
             _write_report(relay, out_dir)
         except BaseException as exc:
@@ -313,7 +336,8 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
             try:  # the terminal state first: lock.close() releases the lock and restores the signal handlers
                 if error is None:
                     try:
-                        _set_state(state, state="done", score=int(relay.score()), error=done_error)
+                        _set_state(state, state="done", score=int(relay.score()), error=done_error,
+                                   reason=done_reason)
                     except Exception as exc:  # noqa: BLE001
                         _set_state(state, state="error", error=str(exc))
                 else:
@@ -321,6 +345,42 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
             finally:
                 lock.close()
     return relay
+
+
+async def _probe_claude(claude, stop: asyncio.Event, timeout_s: float) -> str | None:
+    """Claude's pre-run probe on a daemon thread (an abandoned probe must never delay the process's exit).
+
+    Returns why Claude can't be used, else None. Waits at most `timeout_s`, and gives up at once when `stop` is set
+    (a freeze or an end); either way an unanswered probe turns the Claude checks off."""
+    aloop = asyncio.get_running_loop()
+    done = asyncio.Event()
+    result: dict = {}
+
+    def work() -> None:
+        try:
+            result["problem"] = claude.probe()
+        except BaseException as exc:  # noqa: BLE001 - nothing may escape a daemon thread
+            result["error"] = exc
+        finally:
+            with contextlib.suppress(RuntimeError):  # the loop may be closed by now
+                aloop.call_soon_threadsafe(done.set)
+
+    threading.Thread(target=work, name="claude-probe", daemon=True).start()
+    waiting = [asyncio.create_task(done.wait()), asyncio.create_task(stop.wait())]
+    try:
+        await asyncio.wait(waiting, timeout=timeout_s, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in waiting:
+            t.cancel()
+    if not done.is_set():
+        claude.available = False
+        if not stop.is_set():
+            _log.warning("the Claude probe gave no answer in %.0f s; vision checks are off", timeout_s)
+        return None
+    if "error" in result:
+        claude.available = False
+        return f"probe failed: {result['error']!r}"
+    return result.get("problem")
 
 
 async def _frozen_wait(arms: dict, ctl: FreezeControl, state, home, rtypes, dry_run: bool) -> None:
@@ -447,6 +507,7 @@ async def _supervise(loop, relay: Relay, match: MatchConfig, stop: asyncio.Event
             elif question == "eight_ball_in_bin" and yes:
                 relay.log(now, f"Claude sees the 8-ball in the bin: {why}")
                 relay.eight_ball_alert = True
+                _set_state(statefile, eight_ball_alert=True)
         if claude.available:
             if relay.pending_confirm and "confirm" not in pending:
                 if relay.pending_confirm == "unplug":  # compared with go: a cable already out at go doesn't count

@@ -1079,3 +1079,190 @@ def test_debugview_any_exception_is_a_warning(stub_dream, tmp_path, caplog):
         run(stub_dream, tmp_path)
     assert "open_arm" in stub_dream.calls and stub_dream.states[-1]["state"] == "done"
     assert any("debug view" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Round 3: freezing, early aborts, probe thread, reasons, link restore, eight_ball_alert.
+
+def test_freeze_writes_freezing_before_frozen(stub_dream, tmp_path, ctl, fast_poll):
+    stub_dream.finish = False
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        time.sleep(0.1)
+        freeze(ctl)
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    order = stub_dream.order
+    assert "state:freezing" in order
+    assert order.index("state:running") < order.index("state:freezing") < order.index("state:frozen")
+    assert [s for s in stub_dream.states if s["state"] == "freezing"][0]["stage"] == "unplug"
+
+
+def test_freeze_while_already_frozen_does_not_leave_the_state_at_freezing(stub_dream, tmp_path, ctl, fast_poll):
+    stub_dream.finish = False
+    snap: dict = {}
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        freeze(ctl)
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        n = len(stub_dream.states)
+        freeze(ctl)  # a second freeze while the hold is in place
+        time.sleep(0.3)
+        snap["after"] = [s["state"] for s in stub_dream.states[n:]]
+        snap["now"] = stub_dream.states[-1]["state"]
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl, )
+    finish_driver(t, errors)
+    assert snap["now"] == "frozen" and "freezing" not in snap["after"]
+
+
+def test_freeze_before_the_arms_open_has_a_reason(stub_dream, tmp_path, ctl):
+    stub_dream.on_open_client = lambda: freeze(ctl)
+    run(stub_dream, tmp_path, ctl)
+    final = stub_dream.states[-1]
+    assert final["state"] == "done" and final["reason"] == "frozen_before_open"
+
+
+def test_end_before_the_arms_open_has_a_reason(stub_dream, tmp_path, ctl):
+    stub_dream.on_open_client = ctl.request_end
+    run(stub_dream, tmp_path, ctl)
+    final = stub_dream.states[-1]
+    assert final["state"] == "done" and final["reason"] == "ended_before_open"
+
+
+def test_normal_run_has_no_reason(stub_dream, tmp_path):
+    run(stub_dream, tmp_path)
+    assert stub_dream.states[-1].get("reason") is None
+
+
+@pytest.mark.parametrize("how", ["freeze", "end"])
+def test_freeze_or_end_before_the_cameras_open_does_no_camera_or_client_work(stub_dream, tmp_path, ctl, monkeypatch,
+                                                                             how):
+    def load(path):
+        freeze(ctl) if how == "freeze" else ctl.request_end()
+        return SimpleNamespace(follower_l=None, follower_r=None, inference_log_path=None)
+    monkeypatch.setattr(sys.modules["robots.config"], "load", load)
+    run(stub_dream, tmp_path, ctl)
+    assert stub_dream.camera_opens == 0 and "open_client" not in stub_dream.calls
+    assert stub_dream.ik_calls == 0 and "open_arm" not in stub_dream.calls
+    final = stub_dream.states[-1]
+    assert final["state"] == "done" and final["reason"] == f"{'frozen' if how == 'freeze' else 'ended'}_before_open"
+
+
+def test_freeze_before_the_ik_warmup_skips_it(stub_dream, tmp_path, ctl):
+    stub_dream.on_open_client = lambda: freeze(ctl)  # lands inside open_client, i.e. before the warm-up
+    run(stub_dream, tmp_path, ctl)
+    assert stub_dream.ik_calls == 0
+
+
+def test_lock_refusal_restores_the_previous_run_link(stub_dream, tmp_path):
+    link = tmp_path / "link"
+    prev = tmp_path / "prev-run"
+    prev.mkdir()
+    StateFile(prev, link=link).link_current()
+    stub_dream.lock_error = RuntimeError("the arms are held by 1234 harness run")
+    state = RecordingState(tmp_path / "second", stub_dream)
+    state.link = link
+    state.link_current()
+    assert link.resolve() == (tmp_path / "second").resolve()
+    coro = dream_executor.run_match(MatchConfig(own_color="white"), "ckpt", dry_run=False,
+                                    out_dir=tmp_path / "second", ctl=FreezeControl(), state=state)
+    with pytest.raises(RuntimeError, match="held by 1234"):
+        asyncio.run(coro)
+    assert link.resolve() == prev.resolve()  # the live run's link, not ours
+    assert json.loads((tmp_path / "second" / "state.json").read_text())["state"] == "error"
+
+
+def test_claude_probe_runs_in_a_daemon_thread_and_is_bounded(stub_dream, tmp_path, monkeypatch):
+    release = threading.Event()
+    seen: dict = {}
+
+    def probe():
+        t = threading.current_thread()
+        seen["name"], seen["daemon"] = t.name, t.daemon
+        release.wait(10)
+    stub_dream.probe = probe
+    claude = SimpleNamespace(probe=lambda: stub_dream.probe(), available=True)
+    monkeypatch.setattr(dream_executor, "ClaudeVerifier", lambda: claude)
+    monkeypatch.setattr(dream_executor, "PROBE_TIMEOUT_S", 0.3)
+    t0 = time.monotonic()
+    try:
+        run(stub_dream, tmp_path)
+    finally:
+        release.set()
+    assert time.monotonic() - t0 < 3.0  # did not wait out the 10 s probe
+    assert seen["daemon"] is True and seen["name"] == "claude-probe"
+    assert claude.available is False  # a probe that never answers: Claude checks are off
+    assert stub_dream.states[-1]["state"] == "done"
+
+
+def test_end_during_the_probe_does_not_wait_it_out(stub_dream, tmp_path, ctl, monkeypatch):
+    release = threading.Event()
+    stub_dream.probe = lambda: release.wait(10)
+    snap: dict = {}
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        time.sleep(0.1)
+        snap["t0"] = time.monotonic()
+        end()
+    t, errors = in_thread(driver)
+    try:
+        run(stub_dream, tmp_path, ctl)
+    finally:
+        release.set()
+    finish_driver(t, errors)
+    assert time.monotonic() - snap["t0"] < 3.0
+    assert "loop_exit" not in stub_dream.calls  # the control loop never started
+    assert stub_dream.states[-1]["state"] == "done"
+
+
+def test_freeze_during_the_park_has_a_reason(stub_dream, tmp_path, ctl, monkeypatch):
+    sent: list[bool] = []
+
+    def torque_off(self) -> None:
+        self.world.calls.append("torque_off")
+        if not sent:
+            sent.append(True)
+            freeze(ctl)
+
+    monkeypatch.setattr(StubArm, "torque_off", torque_off)
+    run(stub_dream, tmp_path, ctl)
+    assert stub_dream.states[-1]["reason"] == "freeze_during_park"
+    assert "freezing" not in [s["state"] for s in stub_dream.states]
+
+
+def test_real_supervise_writes_eight_ball_alert(tmp_path, monkeypatch):
+    monkeypatch.setattr(dream_executor, "POLL_S", 0.001)
+    monkeypatch.setattr(dream_executor.vision, "detect", lambda *a: None)
+    monkeypatch.setattr(dream_executor.vision, "draw", lambda *a: None)
+    monkeypatch.setattr(dream_executor.cv2, "imwrite", lambda *a: True)
+    frame = SimpleNamespace(data=None, timestamp_s=0.0)
+    arm = SimpleNamespace(gripper=0.0)
+    loop = SimpleNamespace(video={"scene": frame}, state=SimpleNamespace(left=arm, right=arm), task="t",
+                           set_task=lambda t: None)
+    outcomes = iter([dream_executor.Outcome.PASSED])
+    relay = SimpleNamespace(stage="balls", confirm_kinds=set(), pending_confirm=None, step=None,
+                            observe=lambda *a: next(outcomes, dream_executor.Outcome.RUNNING),
+                            next_step=lambda world, now: SimpleNamespace(instruction="t"), eight_ball_alert=False,
+                            log=lambda *a: None, score=lambda: 0, passed={})
+    claude = SimpleNamespace(available=True, ask=lambda question, *a: (True, "a black ball in the basket"))
+    statefile = StateFile(tmp_path, link=tmp_path / "link")
+    stop = asyncio.Event()
+
+    async def go():
+        task = asyncio.create_task(dream_executor._supervise(
+            loop, relay, SimpleNamespace(calibration=None), stop, tmp_path, claude, statefile=statefile))
+        await asyncio.sleep(0.2)
+        stop.set()
+        await task
+
+    asyncio.run(go())
+    assert relay.eight_ball_alert is True
+    assert json.loads((tmp_path / "state.json").read_text())["eight_ball_alert"] is True
