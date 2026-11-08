@@ -78,6 +78,13 @@ class StubWorld:
         self.finish = True  # the stub supervisor ends the relay at once
         self.arms: dict = {}
         self.home_sleeps = 0
+        self.home_result = True  # what return_to_home returns
+        self.exit_error: Exception | None = None  # raised by the control loop's __aexit__
+        self.on_write = None  # called inside every arm write (a worker thread)
+        self.no_frame = False  # the overhead camera never sends a frame
+        self.on_reader_start = None  # called as the overhead reader starts
+        self.camera_opens = 0
+        self.probe = lambda: None  # ClaudeVerifier.probe, runs in a worker thread
         self.client = SimpleNamespace(name="client", wait_for_ik=self._wait_for_ik)
 
 
@@ -92,6 +99,8 @@ class StubArm:
 
     def write(self, cmd) -> None:
         self.world.calls.append("write")
+        if self.world.on_write is not None:
+            self.world.on_write()
 
     def read(self):
         return SimpleNamespace(positions_rad=[0.1], gripper=1.5)  # gripper out of range: hold clamps it
@@ -182,6 +191,8 @@ def stub_dream(monkeypatch) -> StubWorld:
 
         async def __aexit__(self, *exc):
             world.calls.append("loop_exit")
+            if world.exit_error is not None:
+                raise world.exit_error
             return False
 
         async def run(self) -> None:
@@ -248,7 +259,7 @@ def stub_dream(monkeypatch) -> StubWorld:
             world.home_sleeps += 1
         if world.on_home_done is not None:
             world.on_home_done(world.home_calls)
-        return True
+        return world.home_result
 
     home = _module("robots.home", return_to_home=return_to_home, HOME_DURATION_S=1.0)
 
@@ -258,11 +269,16 @@ def stub_dream(monkeypatch) -> StubWorld:
             world.on_open_client()
         return world.client
 
+    def make_cameras(app):
+        world.camera_opens += 1
+        frame = None if world.no_frame else SimpleNamespace(data=None, timestamp_s=0.0)
+        return [SimpleNamespace(name="scene", frame=frame,
+                                start=lambda: world.on_reader_start() if world.on_reader_start else None,
+                                stop=lambda: None, set_exposure_hold=lambda on: None)]
+
     rrun = _module(
         "robots.run",
-        make_cameras=lambda app: [SimpleNamespace(name="scene", frame=SimpleNamespace(data=None, timestamp_s=0.0),
-                                                  start=lambda: None, stop=lambda: None,
-                                                  set_exposure_hold=lambda on: None)],
+        make_cameras=make_cameras,
         make_kinematics=lambda app: None, open_client=open_client, DryRun=DryArm,
         loop_settings=lambda app: {}, policy_config=lambda app, checkpoint: {"checkpoint": checkpoint},
         with_task=lambda cfg, task: cfg, TRAJ_WARMUP_S=1.0)
@@ -312,7 +328,7 @@ def stub_dream(monkeypatch) -> StubWorld:
     monkeypatch.setattr(dream_executor.cv2, "imwrite", lambda *a: True)
     monkeypatch.setattr(dream_executor, "Relay", StubRelay)
     monkeypatch.setattr(dream_executor, "ClaudeVerifier",
-                        lambda: SimpleNamespace(probe=lambda: None, available=False))
+                        lambda: SimpleNamespace(probe=lambda: world.probe(), available=False))
     monkeypatch.setattr(dream_executor, "_write_report", lambda relay, out_dir: None)
 
     async def supervise(loop, relay, match, stop, out_dir, claude, go_rgb=None, **kw):
@@ -392,7 +408,7 @@ def test_state_transitions_normal_end(stub_dream, tmp_path):
     run(stub_dream, tmp_path)
     names = [s["state"] for s in stub_dream.states]
     dedup = [n for i, n in enumerate(names) if i == 0 or n != names[i - 1]]
-    assert dedup == ["running", "homing", "parking", "done"]
+    assert dedup == ["homing", "running", "homing", "parking", "done"]
     assert stub_dream.states[-1]["score"] == 10
     assert type(stub_dream.states[-1]["score"]) is int
 
@@ -744,7 +760,7 @@ def test_end_then_freeze_in_the_same_busy_moment_stays_frozen(stub_dream, tmp_pa
     order = snap["order"]
     assert "state:frozen" in order and "torque_off" not in order and "state:parking" not in order
     assert "home" not in order  # never homed before the second end
-    assert "state:homing" not in order
+    assert "state:homing" not in order[order.index("state:frozen"):]  # the start-up homing write is earlier
 
 
 def test_freeze_again_inside_frozen_wait_end_home(stub_dream, tmp_path, ctl, fast_poll):
@@ -852,3 +868,186 @@ def test_freeze_as_end_home_finishes_is_not_lost(stub_dream, tmp_path, ctl, fast
     run(stub_dream, tmp_path, ctl)
     finish_driver(t, errors)
     assert "state:parking" not in snap["order"] and "torque_off" not in snap["order"]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Final-review fixes.
+
+def dedup_states(world) -> list[str]:
+    names = [s["state"] for s in world.states]
+    return [n for i, n in enumerate(names) if i == 0 or n != names[i - 1]]
+
+
+def test_state_sequence_live_run(stub_dream, tmp_path):
+    """`starting` means no arm touched: homing is written just before open_arm, running after the start-up home."""
+    run(stub_dream, tmp_path)
+    order = stub_dream.order
+    assert order.index("state:homing") < order.index("open_arm")
+    first_running = order.index("state:running")
+    assert order.index("home") < first_running  # the start-up home came first
+    running = next(s for s in stub_dream.states if s["state"] == "running")
+    assert running["stage"] is None
+
+
+def test_state_sequence_dry_run(stub_dream, tmp_path):
+    run(stub_dream, tmp_path, dry_run=True)
+    order = stub_dream.order
+    assert order.index("state:running") < order.index("open_arm")
+    assert "home" not in order
+    assert next(s for s in stub_dream.states if s["state"] == "running")["stage"] is None
+    assert dedup_states(stub_dream)[0] == "running"
+
+
+def test_freeze_during_slow_probe_reaches_frozen_quickly(stub_dream, tmp_path, ctl, fast_poll):
+    release = threading.Event()
+    stub_dream.probe = lambda: (release.wait(8), None)[1]
+    snap: dict = {}
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        time.sleep(0.1)
+        t0 = time.monotonic()
+        freeze(ctl)
+        wait_for(lambda: has_state(stub_dream, "frozen"), timeout=2.0)
+        snap["dt"] = time.monotonic() - t0
+        release.set()  # let the abandoned probe thread go
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    release.set()
+    finish_driver(t, errors)
+    assert snap["dt"] < 2.0
+    assert "loop_exit" not in stub_dream.calls  # the control loop never started
+
+
+def test_exception_while_frozen_holds_until_end(stub_dream, tmp_path, ctl, fast_poll):
+    stub_dream.finish = False
+    stub_dream.exit_error = sys.modules["robots.errors"].ArmError("motor 3 overheated")
+    snap: dict = {}
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        time.sleep(0.1)
+        freeze(ctl)
+        wait_for(lambda: has_state(stub_dream, "frozen"), timeout=2.0)
+        time.sleep(0.3)
+        snap["order"] = list(stub_dream.order)
+        snap["frozen"] = next(s for s in stub_dream.states if s["state"] == "frozen")
+        end()
+    t, errors = in_thread(driver)
+    with pytest.raises(sys.modules["robots.errors"].ArmError, match="overheated"):
+        run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    before = snap["order"]
+    assert "state:parking" not in before and "torque_off" not in before and before.count("home") == 1
+    assert "overheated" in snap["frozen"]["alarm"]
+    final = json.loads((tmp_path / "state.json").read_text())
+    assert final["state"] == "error" and "overheated" in final["error"]
+    assert stub_dream.calls.count("torque_off") == 2  # parked only after the end request
+
+
+def test_freeze_during_first_frame(stub_dream, tmp_path, ctl, fast_poll):
+    stub_dream.no_frame = True
+    stub_dream.on_reader_start = lambda: freeze(ctl)
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "frozen"), timeout=3.0)
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    assert stub_dream.states[-1]["state"] == "done"  # a freeze is never an error ("no frame" after 10 s would be)
+
+
+def test_freeze_with_failed_home_result_is_still_a_freeze(stub_dream, tmp_path, ctl, fast_poll):
+    stub_dream.home_result = False  # the bool says "did not reach home" because the freeze interrupted it
+    stub_dream.on_home_done = lambda n: freeze(ctl) if n == 1 else None
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    assert not has_state(stub_dream, "error")
+
+
+def test_end_during_hold_is_dropped_until_the_hold_is_in_place(stub_dream, tmp_path, ctl, fast_poll):
+    stub_dream.finish = False
+    sent: list[int] = []
+
+    def on_write():
+        if not sent:  # the first hold write: an end signal lands before `frozen` is written
+            sent.append(1)
+            end()
+            ctl.end_requested.wait(5)
+    stub_dream.on_write = on_write
+    snap: dict = {}
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "running"))
+        freeze(ctl)
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        time.sleep(0.4)
+        snap["order"] = list(stub_dream.order)
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    assert sent
+    assert "state:parking" not in snap["order"] and snap["order"].count("home") == 1  # still frozen at +0.4 s
+
+
+@pytest.mark.parametrize("how", ["sigint", "stop"])
+def test_end_before_arms_open_aborts_cleanly(stub_dream, tmp_path, ctl, how):
+    def on_open_client():
+        if how == "sigint":
+            end()
+            ctl.end_requested.wait(5)
+        else:
+            ctl.request_end()
+    stub_dream.on_open_client = on_open_client
+    run(stub_dream, tmp_path, ctl)
+    calls = stub_dream.calls
+    assert "open_arm" not in calls and "home" not in calls and "torque_off" not in calls
+    assert calls[-1] == "lock_released"
+    final = json.loads((tmp_path / "state.json").read_text())
+    assert final["state"] == "done"
+
+
+def test_freeze_with_camera_error_does_no_camera_work(stub_dream, tmp_path, ctl, fast_poll, monkeypatch):
+    stub_dream.finish = False
+    stub_dream.loop_error = sys.modules["robots.errors"].CameraError("usb dropped")
+
+    def log(self, t, what):
+        if "camera dropped" in what:
+            freeze(ctl)
+    monkeypatch.setattr(StubRelay, "log", log)
+
+    def driver():
+        wait_for(lambda: has_state(stub_dream, "frozen"))
+        end()
+    t, errors = in_thread(driver)
+    run(stub_dream, tmp_path, ctl)
+    finish_driver(t, errors)
+    assert stub_dream.camera_opens == 1  # the initial open only: no reopen after the freeze
+    assert stub_dream.states[-1]["state"] == "done"
+
+
+def test_config_load_failure_releases_lock_and_handlers(stub_dream, tmp_path, monkeypatch):
+    def boom(path):
+        raise RuntimeError("bad station.yaml")
+    monkeypatch.setattr(sys.modules["robots.config"], "load", boom)
+    before = {n: signal.getsignal(n) for n in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    with pytest.raises(RuntimeError, match="bad station.yaml"):
+        run(stub_dream, tmp_path)
+    assert "lock_released" in stub_dream.calls
+    assert {n: signal.getsignal(n) for n in before} == before
+    final = json.loads((tmp_path / "state.json").read_text())
+    assert final["state"] == "error" and "bad station.yaml" in final["error"]
+    assert stub_dream.order.index("state:error") < stub_dream.order.index("lock_released")
+
+
+def test_terminal_state_is_written_before_the_lock_is_released(stub_dream, tmp_path):
+    run(stub_dream, tmp_path)
+    assert stub_dream.order.index("state:done") < stub_dream.order.index("lock_released")
