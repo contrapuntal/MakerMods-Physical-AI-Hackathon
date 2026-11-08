@@ -302,7 +302,8 @@ async def run_match(match: MatchConfig, checkpoint: str, *, dry_run: bool, out_d
         if arms and ctl.frozen:  # a freeze arrived during the park, which cannot be stopped: say so
             msg = "freeze arrived during the park; the park cannot be stopped"
             relay.log(time.monotonic(), msg)
-            _set_state(state, alarm=msg)
+            if error is None and not done_error:  # never `alarm`: that reads as an arm fault after the arms are off
+                done_error = msg
         try:
             _write_report(relay, out_dir)
         except BaseException as exc:

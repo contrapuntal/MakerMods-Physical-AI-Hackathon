@@ -1053,7 +1053,7 @@ def test_terminal_state_is_written_before_the_lock_is_released(stub_dream, tmp_p
     assert stub_dream.order.index("state:done") < stub_dream.order.index("lock_released")
 
 
-def test_freeze_during_the_final_park_is_recorded_as_an_alarm(stub_dream, tmp_path, ctl, monkeypatch):
+def test_freeze_during_the_final_park_is_recorded_in_error_not_alarm(stub_dream, tmp_path, ctl, monkeypatch):
     logs: list[str] = []
     monkeypatch.setattr(StubRelay, "log", lambda self, t, what: logs.append(what))
     sent: list[bool] = []
@@ -1068,7 +1068,8 @@ def test_freeze_during_the_final_park_is_recorded_as_an_alarm(stub_dream, tmp_pa
     run(stub_dream, tmp_path, ctl)
     assert stub_dream.calls.count("torque_off") == 2  # the park still ran to the end
     final = stub_dream.states[-1]
-    assert final["state"] == "done" and "freeze arrived during the park" in (final["alarm"] or "")
+    assert final["state"] == "done" and "freeze arrived during the park" in (final["error"] or "")
+    assert not final.get("alarm") and not any(st.get("alarm") for st in stub_dream.states)
     assert any("freeze arrived during the park" in m for m in logs)
 
 
