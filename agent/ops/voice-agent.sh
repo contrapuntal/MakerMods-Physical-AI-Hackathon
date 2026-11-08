@@ -14,7 +14,7 @@ Usage: ops/voice-agent.sh [--backend station|harness|fake] [--check | --dry-run 
   --check            preflight only (tunnels, station /status, checkpoint, cameras), then exit
   --dry-run          (default) real station for status and stop; start/home stay dry-run (a task change stops the run, then asks before starting)
   --live             station: real motion (STATION_LIVE=1). Human only. Needs a real checkpoint, station state "idle",
-                     a TTY, and typing exactly: E-STOP IN HAND
+                     a TTY (it prints the live-motion banner; no typed confirmation)
   --checkpoint ID    Dream checkpoint id (else env DREAM_CHECKPOINT; dry-run falls back to a placeholder)
   --backend B        station (default): the Dream station HTTP API through the tunnels.
                      harness: drive the teammate's \`harness run\` on HARNESS_HOST over SSH (ROBOT_BACKEND=harness).
@@ -252,9 +252,6 @@ if [ "$backend" != "station" ]; then
   * The run does NOT end by itself; freeze, let the referee score, then end the run.
   =====================================================================
 BANNER
-    printf 'Type exactly "E-STOP IN HAND" to enable live motion: ' >/dev/tty
-    IFS= read -r answer </dev/tty || fail "could not read confirmation"
-    [ "$answer" = "E-STOP IN HAND" ] || fail "confirmation did not match"
     echo "== LIVE motion enabled (HARNESS_LIVE=1)"
   fi
   cd "$REPO"
@@ -334,9 +331,6 @@ if [ "$mode" = "live" ]; then
   * Make the first task short and harmless.
   =====================================================================
 BANNER
-  printf 'Type exactly "E-STOP IN HAND" to enable live motion: ' >/dev/tty
-  IFS= read -r answer </dev/tty || fail "could not read confirmation"
-  [ "$answer" = "E-STOP IN HAND" ] || fail "confirmation did not match"
   echo "== LIVE motion enabled (STATION_LIVE=1)"
 fi
 

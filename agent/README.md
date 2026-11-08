@@ -39,7 +39,7 @@ ops/run-voice.sh --stop     # stop the agent (Ctrl-C in its terminal does the sa
   the agent, sets `LIVEKIT_AGENT_DEPLOYMENT=production` and the team's `HARNESS_RUN_ARGS`, then runs
   `ops/voice-agent.sh`.
 - **Connecting:** in the LiveKit Agent Console, connect to `pah2026-robot-<hostname>` (or set `AGENT_NAME`).
-- **Live motion** (`ops/run-voice.sh --live`) is for a person at the station only. The launcher asks for a typed confirmation, and
+- **Live motion** (`ops/run-voice.sh --live`) is for a person at the station only. It needs a real terminal (it prints the live-motion banner), and
   someone must be at the nuck-3 keyboard to press Ctrl-C.
 
 ## Voice start, freeze and end need the voice-freeze harness

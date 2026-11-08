@@ -179,7 +179,7 @@ model per stage from voice start is not built (review I-3).
 | laptop | `ops/tunnels.sh up` / `status` / `down` | SSH port forwards to nuck-3 (8080, 8091, 8093). Moves nothing. |
 | laptop | `ops/voice-agent.sh --backend harness --check` | Preflight on nuck-3 (ssh, helper, help contract, arms lock, calibration). Needs the human's go-ahead. |
 | laptop | `LIVEKIT_AGENT_DEPLOYMENT=production ops/voice-agent.sh --backend harness` | Starts the voice agent, dry run. Production deployment, so the Agent Console reaches it. |
-| laptop | `… --backend harness --live` | Live (human only), with a typed confirmation. |
+| laptop | `… --backend harness --live` | Live (human only), from a real terminal (it prints the live-motion banner). |
 | laptop | env `HARNESS_DIR`, `HARNESS_CALIBRATION`, `DREAM_CHECKPOINT`, `HARNESS_TIME_LIMIT` (default 3600), `AGENT_NAME` (default `pah2026-robot-<hostname>`), `MATCH_MODE` (default on) | Launcher and agent settings. |
 | laptop | env `VISION_MODEL` (default `google/gemini-3.6-flash`), `VISION_FALLBACK_MODEL` (default `google/gemini-3.8-flash`; `off` disables it) | Camera answers: the first model gets 6 s; if it fails, times out or answers empty, the second gets the rest of the 12 s. |
 | browser | LiveKit Agent Console, agent `pah2026-robot-<hostname>` | Talk to the agent. |

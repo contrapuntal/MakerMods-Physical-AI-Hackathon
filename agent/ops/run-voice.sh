@@ -3,7 +3,7 @@
 #
 #   ops/run-voice.sh            dry run (default): voice start runs `harness run --dry-run`; nothing moves
 #   ops/run-voice.sh --check    preflight only (read-only on nuck-3), then exit
-#   ops/run-voice.sh --live     live motion: HUMAN ONLY, asks for a typed confirmation; someone at the nuck-3 keyboard
+#   ops/run-voice.sh --live     live motion: HUMAN ONLY, in a real terminal; someone at the nuck-3 keyboard
 #   ops/run-voice.sh --fake     local test against a fake harness: no station at all
 #   ops/run-voice.sh --stop     stop the voice agent running on this laptop (Ctrl-C does the same in its terminal)
 #
