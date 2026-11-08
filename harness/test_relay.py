@@ -293,3 +293,31 @@ def test_colour_mode_unchanged():
     assert s.kind == "take_out" and s.target == "green"
     r.other_in_bin, r.own_in_bin = 1, 2
     assert r.score() == 5
+
+
+def test_no_colour_excludes_avoid_balls_listed_in_ball_colors():
+    c = _colour_cal()
+    c.ball_colors = ["orange", "white"]  # white is a coin-flip colour AND a never-grab colour
+    c.avoid_balls = ["white"]
+    w = world([o("ball", "white", 450, 50)], c)
+    r = _balls_relay(c, None, w=w)
+    assert r._our_colours() == ["orange"]
+    assert r.next_step(w, 0.0).kind == "park"  # white is never targeted
+
+
+def test_no_colour_skipped_colour_falls_through_to_the_next():
+    c = _colour_cal()
+    w = world([o("ball", "orange", 450, 50), o("ball", "green", 450, 150)], c)
+    r = _balls_relay(c, None, w=w)
+    r.skipped.add("ball:orange")
+    s = r.next_step(w, 0.0)
+    assert s.kind == "ball" and s.target == "green"
+
+
+def test_log_before_start_is_startup_at_zero():
+    r = Relay(MatchConfig(own_color="orange", calibration=cal()))
+    r.log(123456.0, "frozen before the arms opened")
+    assert (r.events[0].t_s, r.events[0].stage) == (0.0, "startup")
+    r.start(world([], cal()), 1000.0)
+    r.log(1002.0, "later")
+    assert r.events[-1].stage == "unplug" and r.events[-1].t_s == 2.0

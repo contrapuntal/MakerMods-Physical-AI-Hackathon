@@ -75,6 +75,7 @@ class Relay:
         self.stage_index = 0
         self.stage_started_s = 0.0
         self.started_s = 0.0
+        self._started = False
         self.passed: dict[str, float] = {}  # stage -> pass time since go
         self.events: list[Event] = []
         self.attempts: dict[str, int] = {}
@@ -119,8 +120,12 @@ class Relay:
         return ("unplug", "stack", "balls")
 
     def log(self, t: float, what: str) -> None:
-        self.events.append(Event(t - self.started_s, self.stage, what))
-        _log.info("[%5.1f s] %s: %s", t - self.started_s, self.stage, what)
+        if not self._started:  # before go: no match clock yet
+            t_s, stage = 0.0, "startup"
+        else:
+            t_s, stage = t - self.started_s, self.stage
+        self.events.append(Event(t_s, stage, what))
+        _log.info("[%5.1f s] %s: %s", t_s, stage, what)
 
     def time_left(self, t: float) -> float:
         return self.m.time_limit_s - (t - self.started_s)
@@ -133,6 +138,7 @@ class Relay:
     # ------------------------------------------------------------------ the match
     def start(self, world: World, t: float) -> None:
         self.started_s = self.stage_started_s = t
+        self._started = True
         self.go_world = world  # the cleanest view of the table: nothing has moved and no arm is in the way
         self.initial_plugs = len(world.plugs_in_hub())
         self.initial_off_hub = len(world.plugs_off_hub())
@@ -367,12 +373,15 @@ class Relay:
             if on_table:
                 self.log(t, "every own-colour ball left is next to a black or white ball; waiting")
             return Step("balls", "park", PARK, "none", 3.0, needs_release=False, confirm_polls=99)
-        target = self.m.own_color or candidates[0].color
+        fresh = [b for b in candidates if f"ball:{b.color}" not in self.skipped]  # a skipped colour goes last
+        target = self.m.own_color or (fresh or candidates)[0].color
         return Step("balls", "ball", f"pick up the {spoken(target)} ping-pong ball and drop it in the bin "
                     f"{AVOID['balls']}", target, self.m.step_timeout_s)
 
     def _our_colours(self) -> list[str]:
-        return [self.m.own_color] if self.m.own_color else list(self.cal.ball_colors)
+        if self.m.own_color:
+            return [self.m.own_color]
+        return [c for c in self.cal.ball_colors if c not in self.cal.avoid_balls]
 
     def _own_in_bin(self, world: World) -> int:
         return sum(len(world.balls_in_bin(c)) for c in self._our_colours())
