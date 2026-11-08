@@ -72,7 +72,10 @@ def main(argv: list[str] | None = None) -> None:
         _dispatch(args, ctl, state, out)
     except BaseException as exc:  # incl. SystemExit from a bad --color; the agent reads state.json
         if state is not None and not (isinstance(exc, SystemExit) and exc.code in (0, None)):
-            state.update(state="error", error=str(exc.code if isinstance(exc, SystemExit) else exc) or repr(exc))
+            try:
+                state.update(state="error", error=str(exc.code if isinstance(exc, SystemExit) else exc) or repr(exc))
+            except Exception:
+                logging.getLogger(__name__).exception("could not write the error state")
         raise
 
 

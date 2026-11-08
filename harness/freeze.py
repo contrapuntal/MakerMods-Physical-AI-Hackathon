@@ -7,7 +7,6 @@ SIGUSR1 freezes the arms in place: no home move, no switch-off. SIGINT/SIGTERM/S
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import logging
@@ -27,10 +26,19 @@ class FreezeRequested(Exception):
     """Raised inside the run when a freeze arrives."""
 
 
+class _ReentrantEvent(threading.Event):
+    """An Event on an RLock. Python signal handlers run on the main thread, possibly while it holds the event's
+    lock (inside set/clear/wait); with the stock non-reentrant Lock the handler's set()/clear() would deadlock."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cond = threading.Condition(threading.RLock())
+
+
 class FreezeControl:
     def __init__(self) -> None:
-        self.freeze = threading.Event()
-        self.end_requested = threading.Event()
+        self.freeze: threading.Event = _ReentrantEvent()
+        self.end_requested: threading.Event = _ReentrantEvent()
         self.on_freeze: Callable[[], None] | None = None
 
     def install_freeze_signal(self) -> None:
@@ -45,19 +53,8 @@ class FreezeControl:
             except Exception:  # a handler must never raise into the code it interrupted
                 log.exception("on_freeze callback failed")
 
-    @contextlib.contextmanager
-    def _masked(self):
-        """Block SIGUSR1 while the main thread touches the events: their lock is not reentrant, so a handler
-        running inside it would deadlock."""
-        old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
-        try:
-            yield
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, old)
-
     def request_end(self) -> None:
-        with self._masked():
-            self.end_requested.set()
+        self.end_requested.set()
 
     def begin_end(self) -> bool:
         """Clear the freeze before the end home move, so a new freeze can interrupt it.
@@ -65,9 +62,8 @@ class FreezeControl:
         Returns False if a freeze arrived since the end was requested (it clears end_requested); the caller must
         then abort the end and go back to frozen.
         """
-        with self._masked():
-            self.freeze.clear()
-            return self.end_requested.is_set()
+        self.freeze.clear()
+        return self.end_requested.is_set()
 
     @property
     def frozen(self) -> bool:
@@ -90,9 +86,14 @@ class StateFile:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         path = self.out_dir / "state.json"
         fd, tmp = tempfile.mkstemp(dir=self.out_dir, suffix=".tmp")
-        with os.fdopen(fd, "w") as f:
-            json.dump(self.data, f)
-        os.replace(tmp, path)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.data, f)
+            os.replace(tmp, path)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
         return dict(self.data)
 
     def link_current(self) -> None:

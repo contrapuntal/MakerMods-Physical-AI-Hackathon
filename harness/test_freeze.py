@@ -71,6 +71,32 @@ def test_on_freeze_exception_does_not_escape(ctl):
     assert ctl.frozen
 
 
+@pytest.mark.parametrize("which", ["freeze", "end_requested"])
+def test_handler_reentrant_while_event_lock_held(ctl, which):
+    done = threading.Event()
+
+    def run():
+        with getattr(ctl, which)._cond:
+            os.kill(os.getpid(), signal.SIGUSR1)
+        done.set()
+
+    # the handler runs on the main thread, so the deadlock would hang it: drive from main with a watchdog
+    dog = threading.Timer(3, lambda: os._exit(70))
+    dog.start()
+    try:
+        run()
+    finally:
+        dog.cancel()
+    assert done.is_set() and ctl.frozen
+
+
+def test_state_file_cleans_tmp_on_failure(tmp_path):
+    sf = StateFile(tmp_path, link=tmp_path / "link")
+    with pytest.raises(TypeError):
+        sf.update(bad=object())
+    assert not list(tmp_path.glob("*.tmp"))
+
+
 def test_state_file_atomic_and_schema(tmp_path):
     sf = StateFile(tmp_path, link=tmp_path / "link")
     sf.update(state="starting", pid=os.getpid(), started_at=1.0, dry_run=True, freeze_supported=True,
