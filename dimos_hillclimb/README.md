@@ -93,6 +93,22 @@ twice and `check_tower`. The agent gets this plan from `prompt.STATION_PROMPT`. 
 instruction in relay.py's wording, verified from the overhead camera as relay.py does (3 passing polls after the
 gripper opens, 25 s timeout).
 
+### Voice control hooks for `harness run`
+
+`harness run` can be driven from outside (for example a voice front end) with signals and a state file:
+
+- `SIGUSR1` freezes the arms in place: they hold the measured pose, with no home move and no switch-off. It works even
+  before the heavy imports finish; a freeze before the arms open aborts the run.
+- `SIGINT`, `SIGTERM` and `SIGHUP` end the run: home, then park (switch off). After a freeze, an end request homes from
+  the hold; a freeze during that home holds again. Once the park has started it can't be interrupted.
+- `<run_dir>/state.json` (written atomically) has `version`, `state`, `pid`, `started_at`, `stage`, `dry_run`,
+  `freeze_supported`, `score`, `alarm`, `error`, `updated_at`. `state` is one of `starting`, `running`, `frozen`,
+  `homing`, `parking`, `done`, `error`. The symlink `~/.dreamlabs/current-harness-run` points at the run dir
+  (`~/hackathon_runs/<time>` unless `--out`).
+- `~/.dreamlabs/arms.lock` (holder `harness run`) keeps `dreamcli robot run` and `harness run` off the arms at once.
+- Dream's `DebugView` (what the model sees) is served on :8093 during a run.
+- `--color` is optional: omit it and stage 3 bins every ball except the avoid (white) balls; the 8-ball rescue is unchanged.
+
 Offline, a fake station stands in for Dream-1 (it moves symbolic objects in answer to each instruction):
 
 ```bash
