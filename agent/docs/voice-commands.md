@@ -90,6 +90,8 @@ the harness window ends the run.
 | Arm alarm while frozen | "An arm raised an alarm and may drop. Please support it." |
 | A second, untracked harness process | "Another harness process is running on the station; I can't stop it by voice." |
 | The 8-ball lands in our bin | "The black eight ball is in our bin." |
+| A run starts or moves to a new stage (read from the station view's current instruction; retries of the same stage say nothing) | "Picking up the cables now." / "Stacking the blocks now." / "Putting the golf balls into the basket now." / "Taking the black ball back out of the bin." (`STAGE_ANNOUNCE=0` turns these off) |
+| "How does this work?" / "What are you?" | A two-or-three-sentence explanation from fixed facts (the arms and cameras, Dream-1 and the per-stage fine-tunes, the harness and Claude checks, the agent's models, privacy masking, safety), then an offer of one more level |
 
 - **The end warning,** said by the model when it proposes an end: ending sends the arms home and then parks them, and
   that can knock over a standing tower. The emergency word still holds the arms during the home move, but it can't

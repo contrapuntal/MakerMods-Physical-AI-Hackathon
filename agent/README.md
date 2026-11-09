@@ -5,6 +5,14 @@ station cameras ("What can you see?", "How many balls are in the basket?", "Chec
 harness it can also start, freeze and end a `harness run` by voice. This folder is a copy of the agent from the team's
 working repo, so the hackathon repo holds everything the demo uses.
 
+## What it says by itself
+
+- **Stage announcements** ("Picking up the cables now.", "Stacking the blocks now.", "Putting the golf balls into the
+  basket now."): the agent reads the instruction of Dream's newest round trip from the station view over SSH every 3 s
+  (`src/stage_announcer.py`). It speaks once per stage change, quiet on retries, holds and put-downs, while someone is
+  connected.
+- **"How does this work?"**: a short layered explanation from fixed facts in the instructions.
+
 ## Cameras
 
 The agent never opens the station's cameras. It reads the frames Dream-1 already gets, from Dream's DebugView page,
@@ -62,5 +70,6 @@ ops/run-voice.sh --stop     # stop the agent (Ctrl-C in its terminal does the sa
 | `AGENT_LLM` | LiveKit Inference | `AGENT_LLM=omlx` uses an OpenAI-compatible server instead: `OMLX_BASE_URL`, `OMLX_MODEL`, `OMLX_API_KEY` |
 | `TUNNEL_HOST` | `nuck-3` | the SSH host `ops/tunnels.sh` forwards to |
 | `CAMERA_STATION_SSH` | `HARNESS_HOST` in harness mode | the host to fetch frames from over SSH; empty = the tunnel |
+| `STAGE_ANNOUNCE` | on | spoken stage announcements ("Stacking the blocks now."); `0` turns them off |
 
 `docs/voice-commands.md` has every voice command, every spoken line and the harness prompts per stage.

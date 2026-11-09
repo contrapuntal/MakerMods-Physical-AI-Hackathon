@@ -150,10 +150,15 @@ _trip_lock: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
 
 
 def stale_after_s() -> float:
+    """How long the newest trip number may stay the same before the view counts as stale (CAMERA_STATION_STALE_S).
+
+    30 s: at the event Dream answered only every 5-10 s, and with 3 s a second camera fetched on the same trip already
+    counted as stale mid-run. A finished run closes the view altogether (unreachable), so this only covers a view that
+    stays up without new trips: a hold or a stall."""
     try:
         return float(os.environ.get("CAMERA_STATION_STALE_S", ""))
     except ValueError:
-        return 3.0
+        return 30.0
 
 
 def _lock() -> asyncio.Lock:

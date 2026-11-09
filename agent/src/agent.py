@@ -23,6 +23,7 @@ from livekit.agents import (
 from livekit.plugins import ai_coustics, openai
 
 import vision
+import stage_announcer
 from robot_gate import (
     ESTOP_NOW, FREEZE_WORD_RE, RETRYING_SPEECH, SENT_TEXT, STOP_FAILED_SPEECH, MatchMode, RobotGate, UserTurn,
     is_stop_failure,
@@ -326,6 +327,24 @@ HARNESS_INSTRUCTIONS = textwrap.dedent(
 
     """
 ) + _CAMERA_SECTION
+
+_EXPLAIN_SECTION = textwrap.dedent(
+    """\
+
+    # Explaining the system (when asked how this works, what you are, or how the robot decides what to do)
+
+    - Answer in two or three short spoken sentences, then offer one more level, for example "Want to hear how the cameras work?". Use only these facts; never invent models, numbers or features.
+    - The robot: two MakerMods Metal arms with grippers, watched by three cameras, one over the table and one on each wrist.
+    - The brain: Dream-1, a vision-language-action model from Dream Labs. It looks at the camera frames and the arm positions, plans the next short stretch of motion, and the station plays it out smoothly. The team fine-tuned a version for each stage on demonstrations they recorded themselves: unplugging the cables, stacking the blocks, and the balls.
+    - The hill climb program on the station runs a match: unplug the USB cables, stack a tower, then put balls in the bin. It checks progress with its own camera detection and with Claude vision checks, moves on when a stage passes, and switches to that stage's model.
+    - You, the voice agent: built with LiveKit Agents, running on a laptop next to the station. Speech to text is AssemblyAI, your thinking is a Gemma 4 model, and your voice is Fish Audio, all through LiveKit Inference. For camera questions you read the frames the robot already sees and ask Gemini Flash about them.
+    - Privacy: before a frame leaves the laptop, the top of the picture, where people stand, is greyed out and faces are blurred.
+    - Safety: the emergency word on the screen holds the arms at once, with no confirmation. Starting or ending a run needs a spoken yes. Once the referee says go, you stay silent, because nobody may give the robot any input during a match, voice included.
+    - When explaining, never say the emergency word itself; call it the emergency word on the screen.
+    """
+)
+INSTRUCTIONS += _EXPLAIN_SECTION
+HARNESS_INSTRUCTIONS += _EXPLAIN_SECTION
 
 
 class BaseAssistant(Agent):
@@ -723,6 +742,11 @@ async def my_agent(ctx: JobContext):
     monitor.start()
     ctx.add_shutdown_callback(monitor.aclose)
     _warm = asyncio.create_task(vision.warmup())  # keep a reference; loads the face blurrer off-loop
+    # Stage announcements ("Stacking the blocks now."): read-only, from the station view's current instruction over ssh.
+    if vision.station_ssh_host() and stage_announcer.enabled():
+        announcer = stage_announcer.StageAnnouncer(vision.station_ssh_host(), lambda line: say_with_retry(session, line))
+        announcer.start()
+        ctx.add_shutdown_callback(announcer.aclose)
 
     # Fast path that skips the LLM: "freeze" or "halt" among the first two words of a FINAL transcript (never interim, negation-guarded) fires /stop right away.
     # Event name and fields (transcript, is_final) verified in livekit/agents/voice/events.py (1.8.10).
